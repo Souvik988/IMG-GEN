@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: shotlin
       POSTGRES_DB: shotlin
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - shotlin_pgdata:/var/lib/postgresql/data
     healthcheck:

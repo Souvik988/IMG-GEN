@@ -32,7 +32,7 @@ import {
   workflowVersions,
   workflows,
 } from "@shotlin/database";
-import { CUSTOMER_FACING_STATES } from "@shotlin/core";
+import { CUSTOMER_FACING_STATES, MAX_ANGLES, resolveAngleSet } from "@shotlin/core";
 import type { Storage } from "@shotlin/platform";
 import { z } from "zod";
 import { AuthGuard, parseWith } from "../common";
@@ -59,7 +59,9 @@ const createJobSchema = z.object({
   environmentPresetId: z.string().uuid().nullable().optional(),
   resolution: z.enum(["1k", "2k", "4k"]).default("2k"),
   aspectRatio: z.enum(["portrait", "square", "landscape"]).default("portrait"),
-  outputCount: z.union([z.literal(1), z.literal(2), z.literal(4)]).default(1),
+  outputCount: z.number().int().min(1).max(MAX_ANGLES).default(1),
+  /** Optional explicit camera angles; defaults are derived from outputCount. */
+  cameraAngles: z.array(z.string()).max(MAX_ANGLES).nullable().optional(),
 });
 
 const feedbackSchema = z.object({
@@ -175,6 +177,7 @@ class JobsService {
             requestedResolution: input.resolution,
             aspectRatio: input.aspectRatio,
             outputCount: input.outputCount,
+            cameraAngles: resolveAngleSet(input.outputCount, input.cameraAngles),
             idempotencyKey: key,
             idempotencyFingerprint: fingerprint,
             characterId: input.characterId ?? null,
@@ -258,44 +261,84 @@ class JobsService {
       .select()
       .from(jobOutputs)
       .where(eq(jobOutputs.jobId, job.id))
-      .limit(1);
-    const out = outRows[0];
-    const candidateRows = await this.db
-      .select({ asset: assets })
-      .from(generationCandidates)
-      .innerJoin(assets, eq(assets.id, generationCandidates.assetId))
-      .where(eq(generationCandidates.jobId, job.id))
-      .orderBy(desc(generationCandidates.createdAt))
-      .limit(1);
-    const candidate = candidateRows[0]?.asset;
+      .orderBy(jobOutputs.sequence);
 
-    const outputAssetIds = [
-      out?.masterAssetId,
-      out?.previewAssetId,
-      out?.jpgAssetId,
-    ].filter((assetId): assetId is string => Boolean(assetId));
-    const outputAssets = outputAssetIds.length
-      ? await this.db.select().from(assets).where(inArray(assets.id, outputAssetIds))
-      : [];
-    const byId = new Map(outputAssets.map((asset) => [asset.id, asset]));
-    const master = out ? byId.get(out.masterAssetId) : undefined;
-    const preview = out?.previewAssetId ? byId.get(out.previewAssetId) : undefined;
-    const jpg = out?.jpgAssetId ? byId.get(out.jpgAssetId) : undefined;
-    const delivery = out ? "final" : candidate ? "stored_candidate" : "none";
+    let images: Array<{
+      sequence: number;
+      cameraAngle: string | null;
+      previewUrl: string | null;
+      downloads: { png: string | null; jpg: string | null };
+    }>;
+    let delivery: "final" | "stored_candidate" | "none";
 
-    const [pngUrl, previewUrl, jpgUrl] = await Promise.all([
-      master
-        ? this.storage.presignGet(master.bucket, master.objectKey, 3600)
-        : candidate
-          ? this.storage.presignGet(candidate.bucket, candidate.objectKey, 3600)
-          : null,
-      preview
-        ? this.storage.presignGet(preview.bucket, preview.objectKey, 3600)
-        : candidate
-          ? this.storage.presignGet(candidate.bucket, candidate.objectKey, 3600)
-          : null,
-      jpg ? this.storage.presignGet(jpg.bucket, jpg.objectKey, 3600) : null,
-    ]);
+    if (outRows.length) {
+      // Finalized: read the delivered set exactly as `finalize` wrote it.
+      const outputAssetIds = outRows
+        .flatMap((row) => [row.masterAssetId, row.previewAssetId, row.jpgAssetId])
+        .filter((assetId): assetId is string => Boolean(assetId));
+      const outputAssets = outputAssetIds.length
+        ? await this.db.select().from(assets).where(inArray(assets.id, outputAssetIds))
+        : [];
+      const byId = new Map(outputAssets.map((asset) => [asset.id, asset]));
+      const sign = (assetId: string | null | undefined) => {
+        const asset = assetId ? byId.get(assetId) : undefined;
+        return asset ? this.storage.presignGet(asset.bucket, asset.objectKey, 3600) : null;
+      };
+      images = await Promise.all(
+        outRows.map(async (row) => {
+          const [png, previewSigned, jpg] = await Promise.all([
+            sign(row.masterAssetId),
+            sign(row.previewAssetId),
+            sign(row.jpgAssetId),
+          ]);
+          return {
+            sequence: row.sequence,
+            cameraAngle: row.cameraAngle,
+            previewUrl: previewSigned ?? png,
+            downloads: { png, jpg },
+          };
+        }),
+      );
+      delivery = "final";
+    } else {
+      // Not finalized (e.g. stopped for manual review after retries): the
+      // generation actually ran and was paid for, so every angle from the
+      // most recent attempt must still be visible, not just one arbitrary
+      // candidate. Scope strictly to the latest attempt — an earlier retry's
+      // candidates must not be mixed in with the current ones.
+      const [latestAttempt] = await this.db
+        .select({ id: jobAttempts.id })
+        .from(jobAttempts)
+        .where(eq(jobAttempts.jobId, job.id))
+        .orderBy(desc(jobAttempts.attemptNumber))
+        .limit(1);
+
+      const candidateRows = latestAttempt
+        ? await this.db
+            .select({ candidate: generationCandidates, asset: assets })
+            .from(generationCandidates)
+            .innerJoin(assets, eq(assets.id, generationCandidates.assetId))
+            .where(eq(generationCandidates.attemptId, latestAttempt.id))
+            .orderBy(generationCandidates.sequence)
+        : [];
+
+      images = await Promise.all(
+        candidateRows.map(async (row) => ({
+          sequence: row.candidate.sequence,
+          cameraAngle: row.candidate.cameraAngle,
+          previewUrl: await this.storage.presignGet(row.asset.bucket, row.asset.objectKey, 3600),
+          downloads: {
+            png: await this.storage.presignGet(row.asset.bucket, row.asset.objectKey, 3600),
+            jpg: null,
+          },
+        })),
+      );
+      delivery = images.length ? "stored_candidate" : "none";
+    }
+
+    // Single-image callers keep reading the flat fields; a multi-angle set
+    // exposes the anchor frame there and the full set under `images`.
+    const anchor = images[0];
 
     return {
       jobId: job.id,
@@ -305,10 +348,13 @@ class JobsService {
       characterId: job.characterId,
       environmentPresetId: job.environmentPresetId,
       delivery,
-      previewUrl,
+      requestedCount: job.outputCount,
+      deliveredCount: images.length,
+      images,
+      previewUrl: anchor?.previewUrl ?? null,
       downloads: {
-        png: pngUrl,
-        jpg: jpgUrl,
+        png: anchor?.downloads.png ?? null,
+        jpg: anchor?.downloads.jpg ?? null,
       },
     };
   }
@@ -329,6 +375,7 @@ class JobsService {
           .select()
           .from(jobOutputs)
           .where(eq(jobOutputs.jobId, job.id))
+          .orderBy(jobOutputs.sequence)
           .limit(1);
         const previewAssetId = out[0]?.previewAssetId ?? out[0]?.masterAssetId;
         if (previewAssetId) {

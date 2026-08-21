@@ -469,6 +469,8 @@ export const jobs = pgTable(
       .default("2k"),
     aspectRatio: text("aspect_ratio").notNull().default("portrait"),
     outputCount: integer("output_count").notNull().default(1),
+    /** Ordered camera angle keys for a multi-angle set; index 0 is the anchor. */
+    cameraAngles: jsonb("camera_angles").$type<string[]>().notNull().default([]),
     /** Client-supplied key that makes a generate request safe to retry. */
     idempotencyKey: text("idempotency_key"),
     /** Hash of the normalized request; key reuse with another payload is rejected. */
@@ -639,6 +641,10 @@ export const generationCandidates = pgTable(
       .references(() => assets.id, { onDelete: "restrict" }),
     sequence: integer("sequence").notNull().default(1),
     isFinal: boolean("is_final").notNull().default(false),
+    /** Camera angle key from @shotlin/core, null for single-image jobs. */
+    cameraAngle: text("camera_angle"),
+    /** True for the anchor frame every other angle locks its identity onto. */
+    isAnchor: boolean("is_anchor").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -706,8 +712,7 @@ export const jobOutputs = pgTable(
     id: uuid("id").primaryKey().defaultRandom(),
     jobId: uuid("job_id")
       .notNull()
-      .references(() => jobs.id, { onDelete: "cascade" })
-      .unique(),
+      .references(() => jobs.id, { onDelete: "cascade" }),
     masterAssetId: uuid("master_asset_id")
       .notNull()
       .references(() => assets.id, { onDelete: "restrict" }),
@@ -717,11 +722,18 @@ export const jobOutputs = pgTable(
     jpgAssetId: uuid("jpg_asset_id").references(() => assets.id, {
       onDelete: "set null",
     }),
+    /** Delivery order within a multi-angle set; 1 is the anchor frame. */
+    sequence: integer("sequence").notNull().default(1),
+    /** Camera angle key from @shotlin/core, null for single-image jobs. */
+    cameraAngle: text("camera_angle"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
-  (t) => [index("job_outputs_job_idx").on(t.jobId)],
+  (t) => [
+    index("job_outputs_job_idx").on(t.jobId),
+    uniqueIndex("job_outputs_job_sequence_unique").on(t.jobId, t.sequence),
+  ],
 );
 
 /* ------------------------------------------------------------------ */
