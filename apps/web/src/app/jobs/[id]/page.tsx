@@ -23,13 +23,30 @@ type JobStatus = {
   isTerminal: boolean;
   stateEvents: StateEvent[];
 };
+type ResultImage = {
+  sequence: number;
+  cameraAngle: string | null;
+  previewUrl: string | null;
+  downloads: { png: string | null; jpg: string | null };
+};
 type JobResult = {
   state: string;
   resolution: string;
   aspectRatio: string;
   delivery: "final" | "stored_candidate" | "none";
+  requestedCount?: number;
+  deliveredCount?: number;
+  images?: ResultImage[];
   previewUrl: string | null;
   downloads: { png: string | null; jpg: string | null };
+};
+
+const angleLabels: Record<string, string> = {
+  front: "Front",
+  three_quarter_left: "3/4 Left",
+  three_quarter_right: "3/4 Right",
+  profile_left: "Side Profile",
+  back: "Back",
 };
 
 const stateLabels: Record<string, string> = {
@@ -74,6 +91,7 @@ export default function Job() {
   const [result, setResult] = useState<JobResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [selectedImage, setSelectedImage] = useState(0);
 
   useEffect(() => {
     if (!id) return;
@@ -118,6 +136,16 @@ export default function Job() {
   const state = job?.state ?? "created";
   const hasStoredCandidate = result?.delivery === "stored_candidate";
   const isFailure = !hasStoredCandidate && stoppingStates.has(state);
+  const galleryImages = result?.images ?? [];
+  const activeImage = galleryImages[selectedImage] ?? galleryImages[0] ?? null;
+  const activeAngleLabel = activeImage?.cameraAngle
+    ? angleLabels[activeImage.cameraAngle] ?? activeImage.cameraAngle
+    : null;
+  // A short set means at least one angle did not clear quality review.
+  const missingAngles =
+    result?.requestedCount && result.deliveredCount
+      ? result.requestedCount - result.deliveredCount
+      : 0;
   const resultLabel = hasStoredCandidate ? "Image saved" : stateLabels[state] ?? state;
   const workflowStateLabel = hasStoredCandidate && stoppingStates.has(state) ? "review stopped" : state;
   const recordedStates = new Set(status?.stateEvents.map((event) => event.toState) ?? []);
@@ -136,9 +164,9 @@ export default function Job() {
             <p className="lede">View the real file from private storage and the exact workflow status for this run.</p>
           </div>
           <div className="top-actions">
-            {result?.downloads.png && (
-              <a className="button button-ghost" href={result.downloads.png} target="_blank" rel="noreferrer">
-                <Icon name="download" /> {hasStoredCandidate ? "Download image" : "Download master"}
+            {(activeImage?.downloads.png ?? result?.downloads.png) && (
+              <a className="button button-ghost" href={activeImage?.downloads.png ?? result?.downloads.png ?? "#"} target="_blank" rel="noreferrer">
+                <Icon name="download" /> {hasStoredCandidate ? "Download image" : galleryImages.length > 1 ? `Download ${activeAngleLabel ?? "frame"}` : "Download master"}
               </a>
             )}
             <Link className="button button-primary" href="/">Generate another</Link>
@@ -165,15 +193,43 @@ export default function Job() {
               </section>
             )}
 
+            {missingAngles > 0 && (
+              <section className="panel panel-pad" style={{ marginBottom: 18 }}>
+                <div className="panel-head">
+                  <div>
+                    <p className="panel-kicker">Partial set</p>
+                    <h2 className="panel-title">{result?.deliveredCount} of {result?.requestedCount} angles delivered</h2>
+                  </div>
+                  <span className="chip chip-warn">{missingAngles} withheld</span>
+                </div>
+                <p className="help">The angles shown passed quality review. {missingAngles === 1 ? "One angle" : `${missingAngles} angles`} did not meet the fidelity bar and {missingAngles === 1 ? "was" : "were"} not delivered. Generate again to retry the full set.</p>
+              </section>
+            )}
+
             <div className="job-hero">
               <div className="result-art result-art-real">
-                {result?.previewUrl ? (
-                  <img src={result.previewUrl} alt={hasStoredCandidate ? "Stored generated image" : "Generated garment result"} />
+                {activeImage?.previewUrl ?? result?.previewUrl ? (
+                  <img src={activeImage?.previewUrl ?? result?.previewUrl ?? ""} alt={hasStoredCandidate ? "Stored generated image" : `Generated garment result${activeAngleLabel ? ` — ${activeAngleLabel}` : ""}`} />
                 ) : (
                   <div className="result-placeholder">
                     <span className={`state-mark state-${state}`} />
                     <strong>{stateLabels[state] ?? state}</strong>
                     <small>{job ? "The worker is updating this run." : "Loading job status…"}</small>
+                  </div>
+                )}
+                {galleryImages.length > 1 && (
+                  <div className="angle-strip">
+                    {galleryImages.map((image, index) => (
+                      <button
+                        key={image.sequence}
+                        className={`angle-thumb ${index === selectedImage ? "selected" : ""}`}
+                        onClick={() => setSelectedImage(index)}
+                        title={image.cameraAngle ? angleLabels[image.cameraAngle] ?? image.cameraAngle : `Image ${image.sequence}`}
+                      >
+                        {image.previewUrl && <img src={image.previewUrl} alt="" />}
+                        <span>{image.cameraAngle ? angleLabels[image.cameraAngle] ?? image.cameraAngle : `#${image.sequence}`}</span>
+                      </button>
+                    ))}
                   </div>
                 )}
               </div>

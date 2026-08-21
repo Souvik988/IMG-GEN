@@ -317,6 +317,8 @@ export async function createGenerationCandidate(
     assetId: string;
     sequence: number;
     isFinal?: boolean;
+    cameraAngle?: string | null;
+    isAnchor?: boolean;
   },
 ): Promise<GenerationCandidate> {
   const [candidate] = await db
@@ -415,6 +417,8 @@ export async function createJobOutput(
     masterAssetId: string;
     previewAssetId?: string | null;
     jpgAssetId?: string | null;
+    sequence?: number;
+    cameraAngle?: string | null;
   },
 ): Promise<JobOutput> {
   const [output] = await db.insert(jobOutputs).values(input).returning();

@@ -13,3 +13,13 @@ export { calculateCost, estimateNextAttemptCost, sumCosts, type UsageRecord, typ
 export { selectSkills, type SkillMatchContext, type SkillRule } from "./skill-selector";
 export { compilePrompt, type PromptCompileInput, type CompiledPrompt, } from "./prompt-compiler";
 export { validateImageInput, type ImageValidationResult } from "./input-validation";
+export {
+  CAMERA_ANGLES,
+  MAX_ANGLES,
+  defaultAngleSet,
+  resolveAngleSet,
+  isCameraAngleKey,
+  buildAngleInstruction,
+  type CameraAngle,
+  type CameraAngleKey,
+} from "./camera-angles";

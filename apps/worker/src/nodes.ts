@@ -4,7 +4,7 @@
  * in-place, returning nothing (errors propagate up to the processor).
  */
 
-import { eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import * as schema from "@shotlin/database";
 import type { Db } from "@shotlin/database";
 import {
@@ -219,7 +219,7 @@ export const runVision: NodeRunner = async (ctx, node, deps) => {
     const inputs = await deps.db
       .select()
       .from(jobInputs)
-      .where(eq(jobInputs.jobId, ctx.job.id));
+      .where(and(eq(jobInputs.jobId, ctx.job.id), ne(jobInputs.role, "character")));
 
     const refs = await Promise.all(
       inputs.map(async (i) => {
@@ -454,7 +454,7 @@ export const runImageGenerate: NodeRunner = async (ctx, node, deps) => {
     const inputs = await deps.db
       .select()
       .from(jobInputs)
-      .where(eq(jobInputs.jobId, ctx.job.id));
+      .where(and(eq(jobInputs.jobId, ctx.job.id), ne(jobInputs.role, "character")));
 
     const refs = await Promise.all(
       inputs.map(async (i) => {
@@ -482,57 +482,56 @@ export const runImageGenerate: NodeRunner = async (ctx, node, deps) => {
       }
     }
 
-    const result = await deps.providers.generateImage({
-      references: refs,
-      characterReference: characterRef,
-      prompt: ctx.compiledPrompt,
-      resolution: ctx.job.requestedResolution,
-      aspectRatio: ctx.job.aspectRatio,
-      count: ctx.job.outputCount,
-      model: {
-        id: model.id,
-        provider: model.provider as "openrouter" | "mock",
-        modelId: model.modelId,
-        role: model.role,
-      },
-      timeoutMs: node.config.timeoutMs,
-      attemptNumber: ctx.attemptNumber,
-      jobId: ctx.job.id,
-    });
-
-    // Record cost
-    const imgPrices = priceVersion?.imagePrices as Record<string, number> | null;
-    const cost = calculateCost(
-      result.usage,
-      { inputPricePerM: null, outputPricePerM: null, imagePrices: imgPrices },
-      ctx.fxRate,
+    const { CAMERA_ANGLES, resolveAngleSet, buildAngleInstruction } = await import(
+      "@shotlin/core"
     );
-    await recordCostEvent(deps.db, {
-      jobId: ctx.job.id,
-      attemptId: ctx.attempt.id,
-      stepRunId: stepRunId,
-      nodeKey: node.nodeKey,
-      provider: model.provider,
-      modelId: model.id,
-      modelPriceVersionId: priceVersion?.id ?? null,
-      inputTokens: result.usage.inputTokens,
-      outputTokens: result.usage.outputTokens,
-      imageCount: result.usage.imageCount,
-      resolution: result.usage.resolution ?? ctx.job.requestedResolution,
-      usdCost: String(cost.usdCost),
-      fxRate: String(cost.fxRate),
-      inrCost: String(cost.inrCost),
-      providerReportedCostUsd: result.usage.providerReportedCostUsd == null
-        ? null
-        : String(result.usage.providerReportedCostUsd),
-    });
-    ctx.totalCostUsd += cost.usdCost;
-    ctx.totalCostInr += cost.inrCost;
+    const angleKeys = resolveAngleSet(ctx.job.outputCount, ctx.job.cameraAngles);
+    const isMultiAngle = angleKeys.length > 1;
 
-    // Persist generated images to storage
-    for (let i = 0; i < result.images.length; i++) {
-      const img = result.images[i];
-      const key = `outputs/${ctx.job.id}/${ctx.attempt.id}/${ctx.attemptNumber}-${i + 1}.png`;
+    const imgPrices = priceVersion?.imagePrices as Record<string, number> | null;
+    const modelRef = {
+      id: model.id,
+      provider: model.provider as "openrouter" | "mock",
+      modelId: model.modelId,
+      role: model.role,
+    };
+
+    /** Record the spend for one provider call and fold it into the running total. */
+    const chargeUsage = async (usage: Parameters<typeof calculateCost>[0]) => {
+      const cost = calculateCost(
+        usage,
+        { inputPricePerM: null, outputPricePerM: null, imagePrices: imgPrices },
+        ctx.fxRate,
+      );
+      await recordCostEvent(deps.db, {
+        jobId: ctx.job.id,
+        attemptId: ctx.attempt.id,
+        stepRunId: stepRunId,
+        nodeKey: node.nodeKey,
+        provider: model.provider,
+        modelId: model.id,
+        modelPriceVersionId: priceVersion?.id ?? null,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        imageCount: usage.imageCount,
+        resolution: usage.resolution ?? ctx.job.requestedResolution,
+        usdCost: String(cost.usdCost),
+        fxRate: String(cost.fxRate),
+        inrCost: String(cost.inrCost),
+        providerReportedCostUsd: usage.providerReportedCostUsd == null
+          ? null
+          : String(usage.providerReportedCostUsd),
+      });
+      ctx.totalCostUsd += cost.usdCost;
+      ctx.totalCostInr += cost.inrCost;
+    };
+
+    /** Persist one generated image as an asset + candidate row. */
+    const persistCandidate = async (
+      img: { data: Buffer; mimeType: string },
+      opts: { sequence: number; angleKey: string | null; isAnchor: boolean },
+    ) => {
+      const key = `outputs/${ctx.job.id}/${ctx.attempt.id}/${ctx.attemptNumber}-${opts.sequence}.png`;
       await deps.storage.putObject(
         deps.storage.outputsBucket,
         key,
@@ -545,7 +544,7 @@ export const runImageGenerate: NodeRunner = async (ctx, node, deps) => {
         kind: "generated_candidate",
         bucket: deps.storage.outputsBucket,
         objectKey: key,
-        originalFilename: `candidate-${i + 1}.png`,
+        originalFilename: `candidate-${opts.sequence}.png`,
         mimeType: img.mimeType,
         sizeBytes: img.data.length,
       });
@@ -554,17 +553,102 @@ export const runImageGenerate: NodeRunner = async (ctx, node, deps) => {
         jobId: ctx.job.id,
         attemptId: ctx.attempt.id,
         assetId: asset.id,
-        sequence: i + 1,
-        isFinal: i === 0 && ctx.job.outputCount === 1,
+        sequence: opts.sequence,
+        isFinal: false,
+        cameraAngle: opts.angleKey,
+        isAnchor: opts.isAnchor,
       });
 
       ctx.candidates.push({ candidate, qualityReview: null, secondReview: null });
+      return { candidate, image: img };
+    };
+
+    /** One provider call for a single angle. */
+    const generateAngle = async (
+      angleKey: (typeof angleKeys)[number],
+      opts: { isAnchor: boolean; anchorImage?: { data: Buffer; mimeType: string } },
+    ) => {
+      const angle = CAMERA_ANGLES[angleKey];
+      // The anchor frame is appended last so it is the closest reference to the
+      // identity-lock instruction that names it.
+      const angleRefs = opts.anchorImage ? [...refs, opts.anchorImage] : refs;
+      const prompt = isMultiAngle
+        ? `${ctx.compiledPrompt}\n\n${buildAngleInstruction(angle, { isAnchor: opts.isAnchor })}`
+        : ctx.compiledPrompt;
+
+      const result = await deps.providers.generateImage({
+        references: angleRefs,
+        characterReference: characterRef,
+        prompt,
+        resolution: ctx.job.requestedResolution,
+        aspectRatio: ctx.job.aspectRatio,
+        count: 1,
+        model: modelRef,
+        timeoutMs: node.config.timeoutMs,
+        attemptNumber: ctx.attemptNumber,
+        jobId: ctx.job.id,
+      });
+      await chargeUsage(result.usage);
+      const image = result.images[0];
+      if (!image) {
+        throw new Error(`No image returned for camera angle ${angleKey}`);
+      }
+      return image;
+    };
+
+    if (!isMultiAngle) {
+      const image = await generateAngle(angleKeys[0], { isAnchor: true });
+      await persistCandidate(image, {
+        sequence: 1,
+        angleKey: null,
+        isAnchor: true,
+      });
+    } else {
+      // Pass 1 — anchor. Establishes the person and the garment.
+      const anchorImage = await generateAngle(angleKeys[0], { isAnchor: true });
+      await persistCandidate(anchorImage, {
+        sequence: 1,
+        angleKey: angleKeys[0],
+        isAnchor: true,
+      });
+
+      // Pass 2 — remaining angles in parallel, every one locked to the same
+      // anchor so identity drift cannot compound across the set.
+      const fanOut = angleKeys.slice(1);
+      const settled = await Promise.allSettled(
+        fanOut.map((angleKey) =>
+          generateAngle(angleKey, { isAnchor: false, anchorImage }),
+        ),
+      );
+
+      for (let i = 0; i < settled.length; i++) {
+        const outcome = settled[i];
+        if (outcome.status === "fulfilled") {
+          await persistCandidate(outcome.value, {
+            sequence: i + 2,
+            angleKey: fanOut[i],
+            isAnchor: false,
+          });
+        } else {
+          // A single angle failing must not lose the angles that succeeded.
+          console.error(
+            `[worker] job ${ctx.job.id} angle ${fanOut[i]} failed:`,
+            outcome.reason instanceof Error ? outcome.reason.message : outcome.reason,
+          );
+        }
+      }
+    }
+
+    if (ctx.candidates.length === 0) {
+      throw new Error("Image generation produced no candidates");
     }
 
     await completeStepRun(deps.db, stepRunId, {
       status: "succeeded",
       outputRef: {
-        candidateCount: result.images.length,
+        candidateCount: ctx.candidates.length,
+        requestedAngles: angleKeys,
+        deliveredAngles: ctx.candidates.map((c) => c.candidate.cameraAngle),
         assetIds: ctx.candidates.map((c) => c.candidate.assetId),
       },
     });
@@ -887,67 +971,83 @@ export const runFinalize: NodeRunner = async (ctx, node, deps) => {
   const jpgQuality = settings.jpgQuality ?? 90;
 
   await runStep(ctx, node, deps, async (_stepRunId) => {
-    const finalCandidate = ctx.candidates[0];
-    if (!finalCandidate) throw new Error("No candidates to finalize");
+    if (ctx.candidates.length === 0) throw new Error("No candidates to finalize");
 
-    await deps.db
-      .update(schema.generationCandidates)
-      .set({ isFinal: true })
-      .where(eq(schema.generationCandidates.id, finalCandidate.candidate.id));
-
-    const [masterAsset] = await deps.db
-      .select()
-      .from(assets)
-      .where(eq(assets.id, finalCandidate.candidate.assetId))
-      .limit(1);
-    if (!masterAsset) throw new Error("Master asset not found");
-
-    const masterBuf = await deps.storage.getObject(
-      masterAsset.bucket,
-      masterAsset.objectKey,
-    );
-    const previewBuf = await makePreview(masterBuf, previewMaxWidth);
-    const previewKey = `outputs/${ctx.job.id}/${finalCandidate.candidate.id}/preview.webp`;
-    await deps.storage.putObject(
-      deps.storage.outputsBucket,
-      previewKey,
-      previewBuf,
-      "image/webp",
-    );
-
-    const previewAsset = await createAsset(deps.db, {
-      userId: ctx.job.userId,
-      kind: "preview",
-      bucket: deps.storage.outputsBucket,
-      objectKey: previewKey,
-      mimeType: "image/webp",
-      sizeBytes: previewBuf.length,
+    // Deliver every candidate that is not a confirmed quality failure. A single
+    // angle failing review must not withhold the angles that passed.
+    const deliverable = ctx.candidates.filter((c) => {
+      const review = c.secondReview ?? c.qualityReview;
+      return !review || review.criticalDefects.length === 0;
     });
+    // Never deliver nothing: fall back to the anchor so the customer still gets
+    // the frame the rule engine judged the set on.
+    const finalists = deliverable.length > 0 ? deliverable : [ctx.candidates[0]];
 
-    const jpgBuf = await toJpg(masterBuf, jpgQuality);
-    const jpgKey = `outputs/${ctx.job.id}/${finalCandidate.candidate.id}/output.jpg`;
-    await deps.storage.putObject(
-      deps.storage.outputsBucket,
-      jpgKey,
-      jpgBuf,
-      "image/jpeg",
-    );
+    let sequence = 0;
+    for (const entry of finalists) {
+      sequence += 1;
 
-    const jpgAsset = await createAsset(deps.db, {
-      userId: ctx.job.userId,
-      kind: "jpg_variant",
-      bucket: deps.storage.outputsBucket,
-      objectKey: jpgKey,
-      mimeType: "image/jpeg",
-      sizeBytes: jpgBuf.length,
-    });
+      await deps.db
+        .update(schema.generationCandidates)
+        .set({ isFinal: true })
+        .where(eq(schema.generationCandidates.id, entry.candidate.id));
 
-    await createJobOutput(deps.db, {
-      jobId: ctx.job.id,
-      masterAssetId: masterAsset.id,
-      previewAssetId: previewAsset.id,
-      jpgAssetId: jpgAsset.id,
-    });
+      const [masterAsset] = await deps.db
+        .select()
+        .from(assets)
+        .where(eq(assets.id, entry.candidate.assetId))
+        .limit(1);
+      if (!masterAsset) throw new Error("Master asset not found");
+
+      const masterBuf = await deps.storage.getObject(
+        masterAsset.bucket,
+        masterAsset.objectKey,
+      );
+      const previewBuf = await makePreview(masterBuf, previewMaxWidth);
+      const previewKey = `outputs/${ctx.job.id}/${entry.candidate.id}/preview.webp`;
+      await deps.storage.putObject(
+        deps.storage.outputsBucket,
+        previewKey,
+        previewBuf,
+        "image/webp",
+      );
+
+      const previewAsset = await createAsset(deps.db, {
+        userId: ctx.job.userId,
+        kind: "preview",
+        bucket: deps.storage.outputsBucket,
+        objectKey: previewKey,
+        mimeType: "image/webp",
+        sizeBytes: previewBuf.length,
+      });
+
+      const jpgBuf = await toJpg(masterBuf, jpgQuality);
+      const jpgKey = `outputs/${ctx.job.id}/${entry.candidate.id}/output.jpg`;
+      await deps.storage.putObject(
+        deps.storage.outputsBucket,
+        jpgKey,
+        jpgBuf,
+        "image/jpeg",
+      );
+
+      const jpgAsset = await createAsset(deps.db, {
+        userId: ctx.job.userId,
+        kind: "jpg_variant",
+        bucket: deps.storage.outputsBucket,
+        objectKey: jpgKey,
+        mimeType: "image/jpeg",
+        sizeBytes: jpgBuf.length,
+      });
+
+      await createJobOutput(deps.db, {
+        jobId: ctx.job.id,
+        masterAssetId: masterAsset.id,
+        previewAssetId: previewAsset.id,
+        jpgAssetId: jpgAsset.id,
+        sequence,
+        cameraAngle: entry.candidate.cameraAngle,
+      });
+    }
 
     await finalizeJobCost(
       deps.db,

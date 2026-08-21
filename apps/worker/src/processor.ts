@@ -81,7 +81,10 @@ export async function processGenerationJob(
 
   // Budget check before starting a new attempt
   const currentSpendInr = Number(data.job.totalCostInr ?? 0);
-  const hardStop = Number(data.budgetRules.hardStopInr ?? 20);
+  // The configured hard stop is priced per delivered image, so a multi-angle
+  // set scales its ceiling instead of aborting partway through the fan-out.
+  const imagesRequested = Math.max(Number(data.job.outputCount ?? 1), 1);
+  const hardStop = Number(data.budgetRules.hardStopInr ?? 20) * imagesRequested;
   const resolution = data.job.requestedResolution;
 
   const imageModel = data.modelsByRole.get("image_generator");
