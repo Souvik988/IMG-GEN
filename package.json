@@ -1,0 +1,24 @@
+{
+  "name": "shotlin-mvp",
+  "private": true,
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "setup": "pnpm install && docker compose up -d && pnpm build && pnpm -F @shotlin/database db:migrate && pnpm -F @shotlin/database db:seed",
+    "dev": "turbo run dev",
+    "build": "turbo run build",
+    "check": "turbo run check",
+    "test": "turbo run test",
+    "db:generate": "pnpm -F @shotlin/database db:generate",
+    "db:migrate": "pnpm -F @shotlin/database db:migrate",
+    "db:seed": "pnpm -F @shotlin/database db:seed",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "turbo": "^2.5.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}

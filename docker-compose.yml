@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: shotlin-postgres
+    environment:
+      POSTGRES_USER: shotlin
+      POSTGRES_PASSWORD: shotlin
+      POSTGRES_DB: shotlin
+    ports:
+      - "5433:5432"
+    volumes:
+      - shotlin_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shotlin -d shotlin"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: shotlin-redis
+    ports:
+      - "6381:6379"
+    volumes:
+      - shotlin_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio:
+    image: minio/minio
+    container_name: shotlin-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: shotlin
+      MINIO_ROOT_PASSWORD: shotlin-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - shotlin_miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 shotlin shotlin-secret &&
+      mc mb -p local/uploads || true;
+      mc mb -p local/outputs || true;
+      echo 'buckets ready'"
+    restart: "no"
+
+volumes:
+  shotlin_pgdata:
+  shotlin_redisdata:
+  shotlin_miniodata:

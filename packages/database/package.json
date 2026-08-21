@@ -1,0 +1,34 @@
+{
+  "name": "@shotlin/database",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "echo \"no tests in database package\"",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "tsx src/migrate.ts",
+    "db:seed": "tsx src/seed.ts"
+  },
+  "dependencies": {
+    "@shotlin/platform": "workspace:*",
+    "drizzle-orm": "^0.44.0",
+    "pg": "^8.15.0",
+    "dotenv": "^16.6.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.0",
+    "drizzle-kit": "^0.31.0",
+    "tsx": "^4.20.0"
+  }
+}
