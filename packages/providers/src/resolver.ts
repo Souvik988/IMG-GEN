@@ -46,6 +46,16 @@ export function resolveProviders() {
           model: input.model,
           timeoutMs: input.timeoutMs,
           maxTokens: 1_800,
+          // Same Qwen hidden-thinking issue documented on reviewCandidate/
+          // secondReview below: strict-schema mode combined with attached
+          // images can make the model spend its entire token budget on
+          // hidden reasoning, leaving nothing for the visible JSON answer
+          // (observed live as "No JSON object found in model output").
+          // Vision attaches even more images (every garment reference) than
+          // the 2-image QA calls this was first fixed for, so it's at least
+          // as exposed.
+          strictSchema: false,
+          disableReasoning: true,
         },
         config.OPENROUTER_API_KEY,
       );

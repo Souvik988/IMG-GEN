@@ -49,7 +49,12 @@ export type ReviewCandidateInput = {
 
 export type GenerateImageInput = {
   references: ImageInput[];
-  characterReference?: ImageInput;
+  /**
+   * One or more character identity photos (front/¾/full-body when a
+   * catalog character's identity pack has them, or a single customer
+   * upload). All are sent as generation references alongside `references`.
+   */
+  characterReferences?: ImageInput[];
   prompt: string;
   resolution: string; // "1k" | "2k" | "4k"
   aspectRatio: string; // "portrait" | "square" | "landscape"

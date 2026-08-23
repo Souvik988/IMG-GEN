@@ -8,12 +8,21 @@ export type ExtractedImageMeta = {
   blurVariance: number | null;
 };
 
+// A compressed file's byte size says nothing about its decoded pixel count
+// — a small, deliberately crafted image can still expand to a huge raw
+// bitmap on decode ("decompression bomb"). 50 megapixels is far beyond any
+// real garment photo (a 45MP DSLR shot is ~8200x5500) but caps sharp's
+// worst-case allocation well below sharp's own default ceiling (~268MP),
+// which matters on a memory-constrained host.
+const MAX_DECODE_PIXELS = 50_000_000;
+
 /**
  * Decode an image buffer and extract deterministic metadata.
- * Throws on corrupted images (sharp fails to decode).
+ * Throws on corrupted images (sharp fails to decode) or images that exceed
+ * the pixel-count ceiling above.
  */
 export async function extractImageMeta(buffer: Buffer): Promise<ExtractedImageMeta> {
-  const image = sharp(buffer, { failOn: "error" });
+  const image = sharp(buffer, { failOn: "error", limitInputPixels: MAX_DECODE_PIXELS });
   const meta = await image.metadata();
   if (!meta.width || !meta.height) {
     throw new Error("Could not read image dimensions");
@@ -62,6 +71,40 @@ export async function estimateBlurVariance(buffer: Buffer): Promise<number | nul
   } catch {
     return null;
   }
+}
+
+/**
+ * Upscale an image so neither dimension is below `minDimension`, preserving
+ * aspect ratio and output format. A no-op (returns the original buffer,
+ * untouched) if the image already meets the target — this never downscales.
+ *
+ * This is plain interpolation (Lanczos3): it makes an undersized reference
+ * technically usable and visually less jarring, but it cannot recover detail
+ * that was never captured. It does not fix blur — that needs a real
+ * deblur/super-resolution model, which this function deliberately doesn't
+ * attempt.
+ */
+export async function upscaleToMinDimension(
+  buffer: Buffer,
+  mimeType: string,
+  minDimension: number,
+): Promise<{ data: Buffer; width: number; height: number } | null> {
+  const meta = await sharp(buffer).metadata();
+  const width = meta.width ?? 0;
+  const height = meta.height ?? 0;
+  if (width === 0 || height === 0) return null;
+
+  const scale = minDimension / Math.min(width, height);
+  if (scale <= 1) return null;
+
+  const targetWidth = Math.round(width * scale);
+  const targetHeight = Math.round(height * scale);
+  let pipeline = sharp(buffer).resize({ width: targetWidth, height: targetHeight, kernel: "lanczos3" });
+  pipeline = mimeType === "image/png" ? pipeline.png()
+    : mimeType === "image/webp" ? pipeline.webp({ quality: 92 })
+    : pipeline.jpeg({ quality: 92, mozjpeg: true });
+  const data = await pipeline.toBuffer();
+  return { data, width: targetWidth, height: targetHeight };
 }
 
 /** Generate an optimized web preview (webp). */

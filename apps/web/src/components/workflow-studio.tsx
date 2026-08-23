@@ -6,6 +6,15 @@ import { apiFetch } from "../lib/api";
 type Json = Record<string, unknown>;
 type StudioView = "canvas" | "wizard";
 
+type WorkflowVersionMeta = {
+  id: string;
+  workflowId: string;
+  version: number;
+  status: "draft" | "production" | "archived";
+  createdAt: string;
+  publishedAt: string | null;
+};
+
 type WorkflowNode = {
   node: {
     id: string;
@@ -203,6 +212,8 @@ function CostLedger({ totals, models, events }: { totals: CostTotals; models: Co
 export function WorkflowStudio() {
   const [nodes, setNodes] = useState<WorkflowNode[]>([]);
   const [activeVersion, setActiveVersion] = useState<number | null>(null);
+  const [versions, setVersions] = useState<WorkflowVersionMeta[]>([]);
+  const [viewingVersionId, setViewingVersionId] = useState<string | null>(null);
   const [models, setModels] = useState<Model[]>([]);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -214,6 +225,10 @@ export function WorkflowStudio() {
   const [studioView, setStudioView] = useState<StudioView>("canvas");
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [orderDirty, setOrderDirty] = useState(false);
+
+  const viewingVersion = versions.find((v) => v.id === viewingVersionId) ?? null;
+  const isEditable = viewingVersion?.status === "draft";
+  const existingDraft = versions.find((v) => v.status === "draft") ?? null;
 
   const selected = nodes.find((item) => item.node.nodeKey === selectedKey) ?? nodes[0] ?? null;
   const selectedPromptVersion = selected?.config?.promptVersionId
@@ -259,7 +274,7 @@ export function WorkflowStudio() {
   useEffect(() => {
     let mounted = true;
     Promise.all([
-      apiFetch<{ nodes: WorkflowNode[]; activeVersion: { version: number } }>("/api/admin/workflow"),
+      apiFetch<{ nodes: WorkflowNode[]; activeVersion: WorkflowVersionMeta; versions: WorkflowVersionMeta[] }>("/api/admin/workflow"),
       apiFetch<{ models: Model[] }>("/api/admin/models"),
       apiFetch<{ prompts: Prompt[] }>("/api/admin/prompts"),
     ])
@@ -267,6 +282,8 @@ export function WorkflowStudio() {
         if (!mounted) return;
         setNodes(workflow.nodes);
         setActiveVersion(workflow.activeVersion.version);
+        setVersions(workflow.versions);
+        setViewingVersionId(workflow.activeVersion.id);
         setModels(modelRows.models);
         setPrompts(promptRows.prompts);
         setSelectedKey(workflow.nodes[0]?.node.nodeKey ?? null);
@@ -276,6 +293,105 @@ export function WorkflowStudio() {
       .finally(() => mounted && setLoading(false));
     return () => { mounted = false; };
   }, []);
+
+  async function refreshVersions() {
+    const workflow = await apiFetch<{ nodes: WorkflowNode[]; activeVersion: WorkflowVersionMeta; versions: WorkflowVersionMeta[] }>("/api/admin/workflow");
+    setVersions(workflow.versions);
+    setActiveVersion(workflow.activeVersion.version);
+    return workflow;
+  }
+
+  async function switchToVersion(versionId: string) {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const detail = await apiFetch<{ version: WorkflowVersionMeta; nodes: WorkflowNode[] }>(`/api/admin/workflow/versions/${versionId}`);
+      setNodes(detail.nodes);
+      setViewingVersionId(detail.version.id);
+      setSelectedKey(detail.nodes[0]?.node.nodeKey ?? null);
+      setOrderDirty(false);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not load that version");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createOrContinueDraft() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const draft = await apiFetch<{ version: WorkflowVersionMeta; nodes: WorkflowNode[] }>("/api/admin/workflow/draft", { method: "POST" });
+      await refreshVersions();
+      setNodes(draft.nodes);
+      setViewingVersionId(draft.version.id);
+      setSelectedKey(draft.nodes[0]?.node.nodeKey ?? null);
+      setOrderDirty(false);
+      setMessage(`Editing draft v${draft.version.version}, cloned from production. Nothing here affects live jobs until you publish.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not create a draft");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function discardDraft() {
+    if (!viewingVersionId || !isEditable) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      await apiFetch(`/api/admin/workflow/versions/${viewingVersionId}`, { method: "DELETE" });
+      const workflow = await refreshVersions();
+      setNodes(workflow.nodes);
+      setViewingVersionId(workflow.activeVersion.id);
+      setSelectedKey(workflow.nodes[0]?.node.nodeKey ?? null);
+      setMessage("Draft discarded.");
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not discard draft");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function publishDraft() {
+    if (!viewingVersionId || !isEditable) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      const check = await apiFetch<{ valid: boolean; errors: string[] }>(`/api/admin/workflow/versions/${viewingVersionId}/validate`, { method: "POST" });
+      if (!check.valid) {
+        setMessage(`Cannot publish — ${check.errors.join("; ")}`);
+        return;
+      }
+      await apiFetch(`/api/admin/workflow/versions/${viewingVersionId}/publish`, { method: "POST" });
+      const workflow = await refreshVersions();
+      setNodes(workflow.nodes);
+      setViewingVersionId(workflow.activeVersion.id);
+      setSelectedKey(workflow.nodes[0]?.node.nodeKey ?? null);
+      setMessage(`v${workflow.activeVersion.version} is now live in production.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not publish draft");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function rollbackToVersion(versionId: string) {
+    setSaving(true);
+    setMessage(null);
+    try {
+      await apiFetch(`/api/admin/workflow/versions/${versionId}/rollback`, { method: "POST" });
+      const workflow = await refreshVersions();
+      setNodes(workflow.nodes);
+      setViewingVersionId(workflow.activeVersion.id);
+      setSelectedKey(workflow.nodes[0]?.node.nodeKey ?? null);
+      setMessage(`Rolled back — v${workflow.activeVersion.version} is now live in production.`);
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not roll back to that version");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   useEffect(() => {
     setPromptBody(selectedPromptVersion?.body ?? "");
@@ -302,7 +418,11 @@ export function WorkflowStudio() {
 
   async function saveNode(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selected) return;
+    if (!selected || !viewingVersionId) return;
+    if (!isEditable) {
+      setMessage("This version is read-only. Create a draft to make changes.");
+      return;
+    }
     const form = new FormData(event.currentTarget);
     let thresholds: Json = {};
     let settings: Json = {};
@@ -316,7 +436,7 @@ export function WorkflowStudio() {
     setSaving(true);
     setMessage(null);
     try {
-      await apiFetch(`/api/admin/workflow/${selected.node.nodeKey}`, {
+      await apiFetch(`/api/admin/workflow/versions/${viewingVersionId}/${selected.node.nodeKey}`, {
         method: "PUT",
         body: JSON.stringify({
           isEnabled: form.get("isEnabled") === "on",
@@ -331,7 +451,7 @@ export function WorkflowStudio() {
       setNodes((current) => current.map((item) => item.node.nodeKey === selected.node.nodeKey
         ? { ...item, node: { ...item.node, isEnabled: form.get("isEnabled") === "on" }, config: { ...(item.config ?? { id: "", modelId: null, promptVersionId: null, timeoutMs: 60000, maxRetries: 1, thresholds: {}, settings: {} }), modelId: String(form.get("modelId") || "") || null, promptVersionId: String(form.get("promptVersionId") || "") || null, timeoutMs: Number(form.get("timeoutMs")), maxRetries: Number(form.get("maxRetries")), thresholds, settings } }
         : item));
-      setMessage(`${selected.node.name} saved to production configuration.`);
+      setMessage(`${selected.node.name} saved to draft v${viewingVersion?.version ?? "?"}.`);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Could not save node");
     } finally {
@@ -340,7 +460,7 @@ export function WorkflowStudio() {
   }
 
   function reorderNodes(sourceKey: string, targetKey: string) {
-    if (sourceKey === targetKey) return;
+    if (sourceKey === targetKey || !isEditable) return;
     setNodes((current) => {
       const sourceIndex = current.findIndex((item) => item.node.nodeKey === sourceKey);
       const targetIndex = current.findIndex((item) => item.node.nodeKey === targetKey);
@@ -368,16 +488,16 @@ export function WorkflowStudio() {
   }
 
   async function saveOrder() {
-    if (!orderDirty) return;
+    if (!orderDirty || !viewingVersionId || !isEditable) return;
     setSaving(true);
     setMessage(null);
     try {
-      await apiFetch("/api/admin/workflow/order", {
+      await apiFetch(`/api/admin/workflow/versions/${viewingVersionId}/order`, {
         method: "PUT",
         body: JSON.stringify({ nodeKeys: nodes.map((item) => item.node.nodeKey) }),
       });
       setOrderDirty(false);
-      setMessage("Execution order saved to the production workflow.");
+      setMessage(`Execution order saved to draft v${viewingVersion?.version ?? "?"}.`);
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "Could not save execution order");
     } finally {
@@ -390,9 +510,25 @@ export function WorkflowStudio() {
 
   return <div className="workflow-studio">
     <section className="studio-toolbar panel panel-pad">
-      <div><p className="panel-kicker">Workflow Studio</p><h2 className="panel-title">Production pipeline · v{activeVersion ?? "—"}</h2><p className="help">Drag nodes to change the execution order, or use the guided wizard. Every node keeps its model, prompt, thresholds, timeout, and retry policy.</p></div>
-      <div className="studio-toolbar-actions"><span className="chip chip-live"><span className="pulse-dot" /> live configuration</span><button type="button" className="button button-coral button-small" disabled={!orderDirty || saving} onClick={saveOrder}>{saving ? "Saving…" : "Save execution order"}</button></div>
+      <div><p className="panel-kicker">Workflow Studio</p><h2 className="panel-title">{isEditable ? `Editing draft · v${viewingVersion?.version ?? "—"}` : `Viewing ${viewingVersion?.status ?? "production"} · v${viewingVersion?.version ?? activeVersion ?? "—"}`}</h2><p className="help">{isEditable ? "Changes here only affect this draft. Publish to make them live." : "Read-only. Create a draft to change the order or any node's configuration."}</p></div>
+      <div className="studio-toolbar-actions">
+        {isEditable ? <span className="chip chip-warn">draft — not live</span> : <span className="chip chip-live"><span className="pulse-dot" /> {viewingVersion?.status ?? "production"}</span>}
+        <div className="studio-toolbar-buttons">
+          {isEditable && <button type="button" className="button button-coral button-small" disabled={!orderDirty || saving} onClick={saveOrder}>{saving ? "Saving…" : "Save execution order"}</button>}
+          {isEditable ? <>
+            <button type="button" className="button button-coral button-small" disabled={saving} onClick={publishDraft}>Publish</button>
+            <button type="button" className="button button-ghost button-small" disabled={saving} onClick={discardDraft}>Discard draft</button>
+          </> : viewingVersion?.status === "archived" ? (
+            <button type="button" className="button button-coral button-small" disabled={saving} onClick={() => rollbackToVersion(viewingVersion.id)}>Roll back to this version</button>
+          ) : (
+            <button type="button" className="button button-ghost button-small" disabled={saving} onClick={createOrContinueDraft}>{existingDraft ? `Continue draft v${existingDraft.version}` : "Create draft"}</button>
+          )}
+        </div>
+      </div>
     </section>
+    <div className="studio-version-strip" role="tablist" aria-label="Workflow versions">
+      {versions.map((v) => <button type="button" key={v.id} role="tab" aria-selected={v.id === viewingVersionId} className={`tab-pill ${v.id === viewingVersionId ? "active" : ""} ${v.status === "draft" ? "tab-pill-draft" : ""}`} onClick={() => switchToVersion(v.id)}>v{v.version} · {v.status}</button>)}
+    </div>
     <section className={`readiness-strip panel panel-pad ${readiness.missingModels.length || readiness.missingPrompts.length ? "readiness-warn" : ""}`} aria-label="Production readiness">
       <div><p className="panel-kicker">Production readiness</p><strong>{readiness.missingModels.length || readiness.missingPrompts.length ? "Needs attention before live generation" : "Ready for a live garment test"}</strong><p className="help">Every enabled model node needs an active price; every prompt-bearing node needs a production prompt version.</p></div>
       <div className="readiness-checks"><span><strong>{readiness.enabledNodes}</strong> enabled nodes</span><span><strong>{readiness.modelNodes}</strong> billed-capable nodes</span><span><strong>{readiness.deterministicNodes}</strong> deterministic/free nodes</span><span><strong>{readiness.promptBound}</strong> prompt bindings</span></div>
@@ -406,14 +542,14 @@ export function WorkflowStudio() {
     <div className="studio-layout">
       {studioView === "canvas" ? <section className="workflow-canvas panel panel-pad" aria-label="Workflow execution order">
         <div className="canvas-label"><span>Input</span><span>Decision path</span><span>Output</span></div>
-        <p className="canvas-hint">Drag a node by its handle. Keyboard users can use the ↑ and ↓ controls.</p>
+        <p className="canvas-hint">{isEditable ? "Drag a node by its handle. Keyboard users can use the ↑ and ↓ controls." : "Read-only — create a draft to reorder nodes."}</p>
         <div className="workflow-rail" role="list">
-          {nodes.map((item, index) => <div className={`workflow-node-wrap ${dragKey === item.node.nodeKey ? "dragging" : ""}`} key={item.node.id} role="listitem" draggable onDragStart={() => setDragKey(item.node.nodeKey)} onDragEnd={() => setDragKey(null)} onDragOver={(event) => event.preventDefault()} onDrop={() => { if (dragKey) reorderNodes(dragKey, item.node.nodeKey); setDragKey(null); }}>
+          {nodes.map((item, index) => <div className={`workflow-node-wrap ${dragKey === item.node.nodeKey ? "dragging" : ""}`} key={item.node.id} role="listitem" draggable={isEditable} onDragStart={() => isEditable && setDragKey(item.node.nodeKey)} onDragEnd={() => setDragKey(null)} onDragOver={(event) => isEditable && event.preventDefault()} onDrop={() => { if (dragKey && isEditable) reorderNodes(dragKey, item.node.nodeKey); setDragKey(null); }}>
             <div className="workflow-node-line"><span className="drag-handle" title="Drag to reorder" aria-hidden="true">⋮⋮</span><button className={`workflow-node ${selected?.node.id === item.node.id ? "selected" : ""} ${item.node.isEnabled ? "" : "disabled"}`} onClick={() => setSelectedKey(item.node.nodeKey)} aria-pressed={selected?.node.id === item.node.id}>
                 <span className="workflow-node-index">{String(index + 1).padStart(2, "0")}</span>
                 <span className="workflow-node-copy"><strong>{item.node.name}</strong><small>{item.node.nodeType}{item.config?.modelId ? " · model bound" : " · no model"}{item.config?.promptVersionId ? " · prompt bound" : ""}</small></span>
                 <span className={`node-state ${item.node.isEnabled ? "on" : "off"}`}>{item.node.isEnabled ? "ON" : "OFF"}</span>
-              </button><div className="workflow-order-actions"><button type="button" className="icon-button" aria-label={`Move ${item.node.name} up`} disabled={index === 0} onClick={() => moveNode(item.node.nodeKey, -1)}>↑</button><button type="button" className="icon-button" aria-label={`Move ${item.node.name} down`} disabled={index === nodes.length - 1} onClick={() => moveNode(item.node.nodeKey, 1)}>↓</button></div></div>
+              </button><div className="workflow-order-actions"><button type="button" className="icon-button" aria-label={`Move ${item.node.name} up`} disabled={!isEditable || index === 0} onClick={() => moveNode(item.node.nodeKey, -1)}>↑</button><button type="button" className="icon-button" aria-label={`Move ${item.node.name} down`} disabled={!isEditable || index === nodes.length - 1} onClick={() => moveNode(item.node.nodeKey, 1)}>↓</button></div></div>
             {item.node.nodeKey === "rule_engine" && <div className="workflow-branch-map" aria-label="SHOTLIN rule branches"><span className="branch-pass">PASS → Finalize → deliver</span><span className="branch-fail">FAIL → Correction skill → Generate again</span></div>}
             {index < nodes.length - 1 && <span className="workflow-connector" aria-hidden="true">↓</span>}
           </div>)}
@@ -426,18 +562,21 @@ export function WorkflowStudio() {
       </section>}
       {selected && <form key={selected.node.id} className="node-inspector panel panel-pad" onSubmit={saveNode}>
         <div className="panel-head"><div><p className="panel-kicker">Node inspector</p><h2 className="panel-title">{selected.node.name}</h2><p className="help">{selected.node.nodeKey} · {selected.node.nodeType}</p></div><span className={`chip ${selected.node.isEnabled ? "" : "chip-warn"}`}>{selected.node.isEnabled ? "enabled" : "disabled"}</span></div>
-        <label className="toggle-row"><span><strong>Run this node</strong><small>Disable only for a deliberate workflow version change.</small></span><input type="checkbox" name="isEnabled" defaultChecked={selected.node.isEnabled} /></label>
-        <div className="studio-fields">
-          <label className="input-field"><span>Model</span><select name="modelId" defaultValue={selected.config?.modelId ?? ""}><option value="">No model / deterministic</option>{selectedModels.map((model) => <option value={model.id} key={model.id}>{model.name} · {model.provider}</option>)}</select></label>
-          <label className="input-field"><span>Prompt version</span><select name="promptVersionId" defaultValue={selected.config?.promptVersionId ?? ""}><option value="">No prompt binding</option>{prompts.flatMap((prompt) => prompt.versions.map((version) => <option value={version.id} key={version.id}>{prompt.name} · v{version.version} · {version.status}</option>))}</select></label>
-          <label className="input-field"><span>Timeout (ms)</span><input name="timeoutMs" type="number" min="1000" max="600000" defaultValue={selected.config?.timeoutMs ?? 60000} /></label>
-          <label className="input-field"><span>Max retries</span><input name="maxRetries" type="number" min="0" max="5" defaultValue={selected.config?.maxRetries ?? 1} /></label>
-          <label className="input-field studio-json"><span>Thresholds JSON</span><textarea name="thresholds" rows={6} defaultValue={pretty(selected.config?.thresholds)} spellCheck={false} /></label>
-          <label className="input-field studio-json"><span>Settings JSON</span><textarea name="settings" rows={6} defaultValue={pretty(selected.config?.settings)} spellCheck={false} /></label>
-          {selectedPromptVersion && <div className="prompt-editor studio-json"><div className="prompt-editor-head"><span>Bound system prompt · v{selectedPromptVersion.version} · {selectedPromptVersion.status}</span><button type="button" className="button button-ghost button-small" onClick={savePromptDraft}>Save as draft version</button></div><textarea rows={10} value={promptBody} onChange={(event) => setPromptBody(event.target.value)} spellCheck={false} /></div>}
-        </div>
+        {!isEditable && <p className="help studio-readonly-note">Read-only — create a draft to edit this node.</p>}
+        <fieldset disabled={!isEditable} className="studio-fieldset">
+          <label className="toggle-row"><span><strong>Run this node</strong><small>Disable only for a deliberate workflow version change.</small></span><input type="checkbox" name="isEnabled" defaultChecked={selected.node.isEnabled} /></label>
+          <div className="studio-fields">
+            <label className="input-field"><span>Model</span><select name="modelId" defaultValue={selected.config?.modelId ?? ""}><option value="">No model / deterministic</option>{selectedModels.map((model) => <option value={model.id} key={model.id}>{model.name} · {model.provider}</option>)}</select></label>
+            <label className="input-field"><span>Prompt version</span><select name="promptVersionId" defaultValue={selected.config?.promptVersionId ?? ""}><option value="">No prompt binding</option>{prompts.flatMap((prompt) => prompt.versions.map((version) => <option value={version.id} key={version.id}>{prompt.name} · v{version.version} · {version.status}</option>))}</select></label>
+            <label className="input-field"><span>Timeout (ms)</span><input name="timeoutMs" type="number" min="1000" max="600000" defaultValue={selected.config?.timeoutMs ?? 60000} /></label>
+            <label className="input-field"><span>Max retries</span><input name="maxRetries" type="number" min="0" max="5" defaultValue={selected.config?.maxRetries ?? 1} /></label>
+            <label className="input-field studio-json"><span>Thresholds JSON</span><textarea name="thresholds" rows={6} defaultValue={pretty(selected.config?.thresholds)} spellCheck={false} /></label>
+            <label className="input-field studio-json"><span>Settings JSON</span><textarea name="settings" rows={6} defaultValue={pretty(selected.config?.settings)} spellCheck={false} /></label>
+            {selectedPromptVersion && <div className="prompt-editor studio-json"><div className="prompt-editor-head"><span>Bound system prompt · v{selectedPromptVersion.version} · {selectedPromptVersion.status}</span><button type="button" className="button button-ghost button-small" onClick={savePromptDraft}>Save as draft version</button></div><textarea rows={10} value={promptBody} onChange={(event) => setPromptBody(event.target.value)} spellCheck={false} /></div>}
+          </div>
+        </fieldset>
         {message && <p className="save-message">{message}</p>}
-        <button className="button button-coral" disabled={saving}>{saving ? "Saving…" : "Save production node"}</button>
+        {isEditable && <button className="button button-coral" disabled={saving}>{saving ? "Saving…" : `Save to draft v${viewingVersion?.version ?? "?"}`}</button>}
       </form>}
     </div>
   </div>;
@@ -486,6 +625,138 @@ export function RunInspector() {
   </div>;
 }
 
+type DiscoverModel = { id: string; name: string; description: string | null };
+type DiscoverDetail = {
+  capabilities: { resolutions: string[]; maxImageRefs: number; supportsMultiOutput: boolean };
+  pricePerImageUsd: number | null;
+  suggestedImagePrices: Record<string, number> | null;
+};
+
+export function ModelsPanel() {
+  const [models, setModels] = useState<Model[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [catalog, setCatalog] = useState<DiscoverModel[] | null>(null);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<DiscoverModel | null>(null);
+  const [detail, setDetail] = useState<DiscoverDetail | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  function reload() {
+    apiFetch<{ models: Model[] }>("/api/admin/models")
+      .then((payload) => setModels(payload.models))
+      .catch((err) => setLoadError(err instanceof Error ? err.message : "Could not load model registry"));
+  }
+  useEffect(() => { reload(); }, []);
+
+  function loadCatalog() {
+    setCatalogLoading(true);
+    setCatalogError(null);
+    apiFetch<{ models: DiscoverModel[] }>("/api/admin/models/discover")
+      .then((payload) => setCatalog(payload.models))
+      .catch((err) => setCatalogError(err instanceof Error ? err.message : "Could not load the OpenRouter catalog"))
+      .finally(() => setCatalogLoading(false));
+  }
+
+  async function pick(model: DiscoverModel) {
+    setSelected(model);
+    setDetail(null);
+    setDetailError(null);
+    try {
+      const d = await apiFetch<DiscoverDetail>(`/api/admin/models/discover-detail?modelId=${encodeURIComponent(model.id)}`);
+      setDetail(d);
+    } catch (err) {
+      setDetailError(err instanceof Error ? err.message : "Could not load this model's capabilities");
+    }
+  }
+
+  async function addModel() {
+    if (!selected || !detail) return;
+    setSaving(true);
+    setMessage(null);
+    try {
+      await apiFetch("/api/admin/models", {
+        method: "POST",
+        body: JSON.stringify({
+          name: selected.name,
+          provider: "openrouter",
+          modelId: selected.id,
+          role: "image_generator",
+          isEnabled: false,
+          capabilities: detail.capabilities,
+          notes: selected.description,
+          prices: detail.suggestedImagePrices ? { imagePrices: detail.suggestedImagePrices } : undefined,
+        }),
+      });
+      setMessage(`${selected.name} added to the catalog, disabled — enable it below once you've reviewed it.`);
+      setSelected(null);
+      setDetail(null);
+      reload();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not add this model");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggleEnabled(model: Model) {
+    setMessage(null);
+    try {
+      await apiFetch(`/api/admin/models/${model.id}`, { method: "PUT", body: JSON.stringify({ isEnabled: !model.isEnabled }) });
+      reload();
+    } catch (err) {
+      setMessage(err instanceof Error ? err.message : "Could not update this model");
+    }
+  }
+
+  const filtered = catalog?.filter((m) => {
+    const q = search.trim().toLowerCase();
+    return !q || m.name.toLowerCase().includes(q) || m.id.toLowerCase().includes(q);
+  }) ?? [];
+
+  return <div className="models-panel">
+    <section className="panel panel-pad">
+      <div className="panel-head"><div><p className="panel-kicker">Live registry</p><h2 className="panel-title">Model registry</h2><p className="help">Every model a workflow node can be bound to. New additions start disabled.</p></div><span className="chip">{models.length} records</span></div>
+      {loadError && <p className="error-copy">{loadError}</p>}
+      {models.length === 0 && !loadError ? <p className="help">Loading…</p> : <div className="table-scroll"><table className="data-table"><thead><tr><th>Name</th><th>Provider</th><th>Role</th><th>Model ID</th><th>Enabled</th></tr></thead><tbody>{models.map((m) => <tr key={m.id}>
+        <td>{m.name}</td>
+        <td>{m.provider}</td>
+        <td>{m.role}</td>
+        <td>{m.modelId}</td>
+        <td><button type="button" className={`chip ${m.isEnabled ? "" : "chip-warn"}`} onClick={() => toggleEnabled(m)}>{m.isEnabled ? "on" : "off"}</button></td>
+      </tr>)}</tbody></table></div>}
+    </section>
+
+    <section className="panel panel-pad">
+      <div className="panel-head"><div><p className="panel-kicker">Add from OpenRouter</p><h2 className="panel-title">Browse the live image-model catalog</h2><p className="help">Capabilities and pricing are read directly from OpenRouter, not guessed — filtered to models that actually support reference images, since every generation here is reference-driven.</p></div>{!catalog && <button type="button" className="button button-ghost button-small" disabled={catalogLoading} onClick={loadCatalog}>{catalogLoading ? "Loading…" : "Load catalog"}</button>}</div>
+      {catalogError && <p className="error-copy">{catalogError}</p>}
+      {catalog && <>
+        <input className="input-field-plain" placeholder="Search models…" value={search} onChange={(event) => setSearch(event.target.value)} />
+        <div className="catalog-list">{filtered.map((m) => <button type="button" key={m.id} className={`catalog-row ${selected?.id === m.id ? "selected" : ""}`} onClick={() => pick(m)}><strong>{m.name}</strong><small>{m.id}</small></button>)}</div>
+      </>}
+    </section>
+
+    {selected && <section className="panel panel-pad">
+      <div className="panel-head"><div><p className="panel-kicker">Preview</p><h2 className="panel-title">{selected.name}</h2><p className="help">{selected.description}</p></div></div>
+      {detailError && <p className="error-copy">{detailError}</p>}
+      {!detail && !detailError && <p className="help">Loading capabilities…</p>}
+      {detail && <>
+        <div className="state-grid">
+          <div className="state-card"><strong>{detail.capabilities.resolutions.map((r) => r.toUpperCase()).join(", ") || "—"}</strong><span>Resolutions</span></div>
+          <div className="state-card"><strong>{detail.capabilities.maxImageRefs}</strong><span>Max reference images</span></div>
+          <div className="state-card"><strong>{detail.capabilities.supportsMultiOutput ? "Yes" : "No"}</strong><span>Multi-output per call</span></div>
+          <div className="state-card"><strong>{detail.pricePerImageUsd != null ? `$${detail.pricePerImageUsd.toFixed(4)}` : "—"}</strong><span>Price / image</span></div>
+        </div>
+        <button type="button" className="button button-coral" disabled={saving} onClick={addModel}>{saving ? "Adding…" : "Add to catalog (disabled by default)"}</button>
+      </>}
+    </section>}
+    {message && <p className="save-message">{message}</p>}
+  </div>;
+}
+
 type QualityRules = { minGarmentFidelity: number; minCharacterIdentity: number; minPhotorealism: number; minAnatomy: number; minTechnicalQuality: number; uncertaintyBand: number; minReviewerConfidence: number; isSecondReviewEnabled: boolean };
 
 export function QualityRulesPanel() {
@@ -518,6 +789,47 @@ type CostHistoryRow = {
   models: CostModelSubtotal[];
 };
 
+type CostSummary = {
+  today: { inr: number; usd: number };
+  total: { inr: number; usd: number };
+  byModel: Array<{ modelId: string | null; modelName: string; provider: string; calls: number; inr: number; usd: number }>;
+  byProvider: Array<{ provider: string; calls: number; inr: number }>;
+  daily: Array<{ day: string; inr: number }>;
+  byResolution: Array<{ resolution: string; successfulJobs: number; totalInr: number; avgInrPerImage: number }>;
+  failed: { inr: number; jobs: number };
+};
+
+function CostSummaryPanel() {
+  const [summary, setSummary] = useState<CostSummary | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiFetch<CostSummary>("/api/admin/costs")
+      .then(setSummary)
+      .catch((err) => setError(err instanceof Error ? err.message : "Could not load cost summary"));
+  }, []);
+
+  if (error) return <section className="panel panel-pad"><p className="error-copy">{error}</p></section>;
+  if (!summary) return <section className="panel panel-pad">Loading cost summary…</section>;
+
+  const maxDaily = Math.max(1, ...summary.daily.map((d) => d.inr));
+
+  return <section className="panel panel-pad cost-summary" aria-label="Aggregate spend breakdown">
+    <div className="panel-head"><div><p className="panel-kicker">Spend, aggregated</p><h2 className="panel-title">Where the money is going</h2><p className="help">Summed straight from the cost ledger — every model call, every job, all time (or today).</p></div></div>
+    <div className="state-grid">
+      <div className="state-card"><strong>{formatInr(summary.today.inr)}</strong><span>Today ({formatUsd(summary.today.usd)})</span></div>
+      <div className="state-card"><strong>{formatInr(summary.total.inr)}</strong><span>All time ({formatUsd(summary.total.usd)})</span></div>
+      <div className="state-card"><strong>{formatInr(summary.failed.inr)}</strong><span>Never delivered ({summary.failed.jobs} job{summary.failed.jobs === 1 ? "" : "s"})</span></div>
+    </div>
+    {summary.daily.length > 0 && <div className="chart" aria-label="Daily spend, last 14 days">{summary.daily.map((d) => <div className="bar-wrap" key={d.day} title={`${d.day}: ${formatInr(d.inr)}`}><div className="bar" style={{ height: `${Math.max(4, (d.inr / maxDaily) * 100)}%` }} /><span className="bar-label">{d.day.slice(5)}</span></div>)}</div>}
+    <div className="inspector-columns">
+      <div><h4>By model</h4>{summary.byModel.length === 0 ? <p className="help">No billed model calls yet.</p> : <table className="data-table"><thead><tr><th>Model</th><th>Calls</th><th>Cost</th></tr></thead><tbody>{summary.byModel.map((m) => <tr key={`${m.modelId}-${m.provider}`}><td>{m.modelName}<small>{m.provider}</small></td><td>{m.calls}</td><td>{formatInr(m.inr)}</td></tr>)}</tbody></table>}</div>
+      <div><h4>By provider</h4>{summary.byProvider.length === 0 ? <p className="help">No billed calls yet.</p> : <table className="data-table"><thead><tr><th>Provider</th><th>Calls</th><th>Cost</th></tr></thead><tbody>{summary.byProvider.map((p) => <tr key={p.provider}><td>{p.provider}</td><td>{p.calls}</td><td>{formatInr(p.inr)}</td></tr>)}</tbody></table>}</div>
+      <div><h4>Cost per delivered image, by resolution</h4>{summary.byResolution.length === 0 ? <p className="help">No successful jobs yet.</p> : <table className="data-table"><thead><tr><th>Resolution</th><th>Delivered</th><th>Avg / image</th></tr></thead><tbody>{summary.byResolution.map((r) => <tr key={r.resolution}><td>{r.resolution.toUpperCase()}</td><td>{r.successfulJobs}</td><td>{formatInr(r.avgInrPerImage)}</td></tr>)}</tbody></table>}</div>
+    </div>
+  </section>;
+}
+
 function CostHistoryPanel() {
   const [history, setHistory] = useState<CostHistoryRow[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -548,5 +860,5 @@ export function BudgetPanel() {
   useEffect(() => { apiFetch<Budget>("/api/admin/budget").then(setBudget).catch((err) => setMessage(err instanceof Error ? err.message : "Could not load budget")); }, []);
   async function save(event: React.FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); const next = Object.fromEntries([...data.entries()].map(([key, value]) => [key, key === "maxAttempts" || key === "perUserDailyJobLimit" ? Number(value) : Number(value)])); try { await apiFetch("/api/admin/budget", { method: "PUT", body: JSON.stringify(next) }); setMessage("Budget controls saved."); } catch (err) { setMessage(err instanceof Error ? err.message : "Could not save budget"); } }
   if (!budget) return <section className="panel panel-pad">{message ?? "Loading budget controls…"}</section>;
-  return <div className="budget-stack"><form className="panel panel-pad config-form" onSubmit={save}><div className="panel-head"><div><p className="panel-kicker">Spend discipline</p><h2 className="panel-title">Budget & retry policy</h2><p className="help">The worker checks the hard stop before every attempt and records cost events per node.</p></div></div><div className="rule-grid">{([ ["warnInr", "Warn at ₹"], ["hardStopInr", "Hard stop at ₹"], ["maxAttempts", "Max attempts"], ["planningBudget1kInr", "Planning 1K ₹"], ["planningBudget2kInr", "Planning 2K ₹"], ["planningBudget4kInr", "Planning 4K ₹"], ["usdInrRate", "USD / INR"], ["perUserDailyJobLimit", "Daily jobs / user"] ] as const).map(([key, label]) => <label className="input-field" key={key}><span>{label}</span><input name={key} type="number" min="0" step="0.01" defaultValue={budget[key]} /></label>)}</div>{message && <p className="save-message">{message}</p>}<button className="button button-coral">Save budget controls</button></form><CostHistoryPanel /></div>;
+  return <div className="budget-stack"><form className="panel panel-pad config-form" onSubmit={save}><div className="panel-head"><div><p className="panel-kicker">Spend discipline</p><h2 className="panel-title">Budget & retry policy</h2><p className="help">The worker checks the hard stop before every attempt and records cost events per node.</p></div></div><div className="rule-grid">{([ ["warnInr", "Warn at ₹"], ["hardStopInr", "Hard stop at ₹"], ["maxAttempts", "Max attempts"], ["planningBudget1kInr", "Planning 1K ₹"], ["planningBudget2kInr", "Planning 2K ₹"], ["planningBudget4kInr", "Planning 4K ₹"], ["usdInrRate", "USD / INR"], ["perUserDailyJobLimit", "Daily jobs / user"] ] as const).map(([key, label]) => <label className="input-field" key={key}><span>{label}</span><input name={key} type="number" min="0" step="0.01" defaultValue={budget[key]} /></label>)}</div>{message && <p className="save-message">{message}</p>}<button className="button button-coral">Save budget controls</button></form><CostSummaryPanel /><CostHistoryPanel /></div>;
 }

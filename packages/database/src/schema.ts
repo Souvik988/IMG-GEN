@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   boolean,
   index,
   integer,
@@ -23,6 +24,11 @@ export const versionStatusEnum = pgEnum("version_status", [
   "test",
   "production",
   "archived",
+]);
+export const identityReferenceRoleEnum = pgEnum("identity_reference_role", [
+  "front",
+  "three_quarter",
+  "full_body",
 ]);
 export const workflowVersionStatusEnum = pgEnum("workflow_version_status", [
   "draft",
@@ -55,6 +61,15 @@ export const assetValidationStatusEnum = pgEnum("asset_validation_status", [
   "pending",
   "usable",
   "rejected",
+]);
+export const detailKindEnum = pgEnum("detail_kind", [
+  "border",
+  "embroidery",
+  "pattern",
+  "neckline",
+  "sleeve",
+  "pallu",
+  "other",
 ]);
 export const inputRoleEnum = pgEnum("input_role", [
   "main_garment",
@@ -162,6 +177,15 @@ export const assets = pgTable(
       .notNull()
       .default("pending"),
     validationReport: jsonb("validation_report").$type<Record<string, unknown>>(),
+    /**
+     * When the original was too small to safely use, `input_check` upscales
+     * it and stores the result as a *separate* asset referenced here —
+     * originals are immutable (see the table comment), so this is additive,
+     * never a replacement of the uploaded bytes.
+     */
+    enhancedAssetId: uuid("enhanced_asset_id").references((): AnyPgColumn => assets.id, {
+      onDelete: "set null",
+    }),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -189,6 +213,35 @@ export const characters = pgTable("characters", {
     .notNull()
     .defaultNow(),
 });
+
+/**
+ * A structured identity pack: up to one reference photo per angle role for
+ * a catalog character. Additive to `characters.previewAssetId` (the
+ * single-photo fallback) — when present, the worker sends all of these as
+ * generation references instead of just the one preview photo, which is
+ * meant to hold identity steadier across angles than a single reference
+ * can.
+ */
+export const characterIdentityReferences = pgTable(
+  "character_identity_references",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    characterId: uuid("character_id")
+      .notNull()
+      .references(() => characters.id, { onDelete: "cascade" }),
+    role: identityReferenceRoleEnum("role").notNull(),
+    assetId: uuid("asset_id")
+      .notNull()
+      .references(() => assets.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("character_identity_references_unique").on(t.characterId, t.role),
+    index("character_identity_references_character_idx").on(t.characterId),
+  ],
+);
 
 export const environmentPresets = pgTable("environment_presets", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -485,6 +538,15 @@ export const jobs = pgTable(
       () => environmentPresets.id,
       { onDelete: "set null" },
     ),
+    /**
+     * Customer's explicit image-generation model choice, if any. Null means
+     * "use whatever the production workflow's image_generate node is bound
+     * to" (the pre-existing behavior, unchanged). When set, the worker uses
+     * this specific model instead — see `loadJobData`.
+     */
+    imageModelId: uuid("image_model_id").references(() => modelRegistry.id, {
+      onDelete: "set null",
+    }),
     /** customer selections snapshot: { ageAppearance, heightAppearance, pose, inputType, genderPresentation } */
     selections: jsonb("selections")
       .$type<Record<string, unknown>>()
@@ -523,6 +585,42 @@ export const jobs = pgTable(
   ],
 );
 
+/**
+ * An immutable snapshot of every runtime-relevant configuration setting at
+ * the moment a job was created — workflow nodes, model bindings, prompt
+ * versions, skill versions, quality thresholds, budget rules, and FX rate.
+ * Written once inside the same transaction as job creation and never
+ * updated afterward, so a job's execution is always reproducible even if an
+ * admin edits the live workflow/models/prompts while the job is running.
+ */
+export const executionManifests = pgTable(
+  "execution_manifests",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" })
+      .unique(),
+    workflowId: uuid("workflow_id").notNull(),
+    workflowVersionId: uuid("workflow_version_id").notNull(),
+    workflowVersionNumber: integer("workflow_version_number").notNull(),
+    /** Array of { nodeKey, sequence, isEnabled, modelId, promptVersionId, timeoutMs, maxRetries, thresholds, settings }. */
+    nodesSnapshot: jsonb("nodes_snapshot").notNull(),
+    /** { [role]: { modelId, provider, modelId: providerModelId } } for every enabled model at creation time. */
+    modelsSnapshot: jsonb("models_snapshot").notNull(),
+    /** Array of { skillId, skillVersionId, priority, instructionHash }. */
+    skillsSnapshot: jsonb("skills_snapshot").notNull(),
+    /** Quality thresholds + budget limits in force at creation time. */
+    qualityRulesSnapshot: jsonb("quality_rules_snapshot").notNull(),
+    budgetRulesSnapshot: jsonb("budget_rules_snapshot").notNull(),
+    fxRate: numeric("fx_rate", { precision: 10, scale: 4 }).notNull(),
+    /** sha256 of the canonicalized snapshot above, for quick equality/audit checks. */
+    manifestHash: text("manifest_hash").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("execution_manifests_job_idx").on(t.jobId)],
+);
+
 export const jobInputs = pgTable(
   "job_inputs",
   {
@@ -534,6 +632,15 @@ export const jobInputs = pgTable(
       .notNull()
       .references(() => assets.id, { onDelete: "restrict" }),
     role: inputRoleEnum("role").notNull(),
+    /**
+     * Only meaningful when role='detail' — which part of the garment this
+     * reference photo shows (border, embroidery, ...). Captured and shown
+     * to reviewers today; not yet consumed by vision analysis or prompt
+     * compilation (that's the fuller Section 18 cross-check against the
+     * truth sheet's own protectedDetails, which needs live vision-model
+     * work and is a separate, larger piece).
+     */
+    detailKind: detailKindEnum("detail_kind"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -645,11 +752,65 @@ export const generationCandidates = pgTable(
     cameraAngle: text("camera_angle"),
     /** True for the anchor frame every other angle locks its identity onto. */
     isAnchor: boolean("is_anchor").notNull().default(false),
+    /**
+     * This candidate's own PASS/FAIL/UNCERTAIN outcome, set once it has been
+     * reviewed. Null means not yet reviewed — finalize must never deliver a
+     * candidate with a null decision.
+     */
+    decision: text("decision"),
+    decisionReasons: jsonb("decision_reasons").$type<string[]>().default([]),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
   (t) => [index("generation_candidates_job_idx").on(t.jobId)],
+);
+
+/**
+ * A structured record of one repair attempt, so retry intelligence survives
+ * attempt/process boundaries instead of living only in worker memory or a
+ * single free-text `job_attempts.repair_instruction` column. Covers both
+ * whole-job retries (anchor failed, regenerate everything) and single-angle
+ * retries (anchor passed, one fan-out angle failed, regenerate just that one).
+ */
+export const retryPlans = pgTable(
+  "retry_plans",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    jobId: uuid("job_id")
+      .notNull()
+      .references(() => jobs.id, { onDelete: "cascade" }),
+    sourceAttemptId: uuid("source_attempt_id")
+      .notNull()
+      .references(() => jobAttempts.id, { onDelete: "cascade" }),
+    sourceCandidateId: uuid("source_candidate_id")
+      .notNull()
+      .references(() => generationCandidates.id, { onDelete: "cascade" }),
+    /** "full_set" regenerates the whole attempt; "single_angle" regenerates only sourceCandidateId. */
+    scope: text("scope").notNull(),
+    failedAngle: text("failed_angle"),
+    criticalDefectCodes: jsonb("critical_defect_codes").$type<string[]>().notNull().default([]),
+    minorDefectCodes: jsonb("minor_defect_codes").$type<string[]>().notNull().default([]),
+    reviewerExplanation: text("reviewer_explanation"),
+    repairInstruction: text("repair_instruction").notNull(),
+    /** What must stay unchanged while repairing — e.g. character/garment identity, environment, lighting. */
+    protectedAttributes: jsonb("protected_attributes").$type<string[]>().notNull().default([]),
+    generationModelId: uuid("generation_model_id").references(() => modelRegistry.id, {
+      onDelete: "set null",
+    }),
+    status: text("status").notNull().default("pending"),
+    /** The new candidate this retry produced, once resolved. */
+    resultCandidateId: uuid("result_candidate_id").references(() => generationCandidates.id, {
+      onDelete: "set null",
+    }),
+    resultDecision: text("result_decision"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  },
+  (t) => [
+    index("retry_plans_job_idx").on(t.jobId),
+    index("retry_plans_source_candidate_idx").on(t.sourceCandidateId),
+  ],
 );
 
 export const qualityReviews = pgTable(
@@ -830,6 +991,14 @@ export const budgetRules = pgTable("budget_rules", {
   minTechnicalQuality: integer("min_technical_quality").notNull().default(88),
   uncertaintyBand: integer("uncertainty_band").notNull().default(3),
   minReviewerConfidence: integer("min_reviewer_confidence").notNull().default(70),
+  /**
+   * Defect codes that always FAIL a candidate, even if the reviewer itself
+   * classified them as minor. Distinct from criticalDefects (which already
+   * fail unconditionally regardless of this list) — this exists specifically
+   * to catch defect types the business considers unacceptable even when a
+   * given reviewer call under-classified their severity.
+   */
+  hardFailDefectCodes: jsonb("hard_fail_defect_codes").$type<string[]>().notNull().default([]),
   isSecondReviewEnabled: boolean("is_second_review_enabled")
     .notNull()
     .default(true),
@@ -927,6 +1096,7 @@ export const adminAuditEvents = pgTable(
 export type User = typeof users.$inferSelect;
 export type Asset = typeof assets.$inferSelect;
 export type Character = typeof characters.$inferSelect;
+export type CharacterIdentityReference = typeof characterIdentityReferences.$inferSelect;
 export type EnvironmentPreset = typeof environmentPresets.$inferSelect;
 export type ModelRegistry = typeof modelRegistry.$inferSelect;
 export type ModelPriceVersion = typeof modelPriceVersions.$inferSelect;
@@ -944,6 +1114,8 @@ export type JobInput = typeof jobInputs.$inferSelect;
 export type JobAttempt = typeof jobAttempts.$inferSelect;
 export type JobStepRun = typeof jobStepRuns.$inferSelect;
 export type GenerationCandidate = typeof generationCandidates.$inferSelect;
+export type RetryPlan = typeof retryPlans.$inferSelect;
+export type ExecutionManifest = typeof executionManifests.$inferSelect;
 export type QualityReviewRow = typeof qualityReviews.$inferSelect;
 export type Defect = typeof defects.$inferSelect;
 export type JobOutput = typeof jobOutputs.$inferSelect;

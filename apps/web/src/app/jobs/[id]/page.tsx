@@ -120,6 +120,64 @@ export default function Job() {
     };
   }, [id]);
 
+  const [downloadingAll, setDownloadingAll] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  /**
+   * Fetches the file into memory and saves it via a same-origin blob: URL,
+   * instead of just navigating to the signed URL — a plain <a href> to a
+   * cross-origin S3/MinIO URL usually just opens the image in a new tab,
+   * not a real one-click download. This is what actually forces a save,
+   * the way ChatGPT's image download does.
+   */
+  async function forceDownload(url: string, filename: string) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Download failed (${response.status})`);
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(objectUrl);
+  }
+
+  async function downloadOne(url: string | null | undefined, filename: string) {
+    if (!url) return;
+    setDownloadError(null);
+    try {
+      await forceDownload(url, filename);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : "Could not download this image");
+    }
+  }
+
+  async function downloadAll() {
+    const targets = galleryImages
+      .map((image, index) => ({
+        url: image.downloads.png ?? image.downloads.jpg,
+        filename: `shotlin-${id}-${image.cameraAngle ?? `image-${index + 1}`}.png`,
+      }))
+      .filter((t): t is { url: string; filename: string } => Boolean(t.url));
+    if (targets.length === 0) return;
+    setDownloadingAll(true);
+    setDownloadError(null);
+    try {
+      for (const target of targets) {
+        await forceDownload(target.url, target.filename);
+        // A short stagger between triggers — browsers can silently drop
+        // several download triggers fired back-to-back in the same tick.
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      }
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : "Could not download all images");
+    } finally {
+      setDownloadingAll(false);
+    }
+  }
+
   async function sendFeedback(rating: "good" | "needs_improvement") {
     try {
       await apiFetch(`/api/jobs/${id}/feedback`, {
@@ -165,13 +223,26 @@ export default function Job() {
           </div>
           <div className="top-actions">
             {(activeImage?.downloads.png ?? result?.downloads.png) && (
-              <a className="button button-ghost" href={activeImage?.downloads.png ?? result?.downloads.png ?? "#"} target="_blank" rel="noreferrer">
+              <button
+                type="button"
+                className="button button-ghost"
+                onClick={() => downloadOne(
+                  activeImage?.downloads.png ?? activeImage?.downloads.jpg ?? result?.downloads.png ?? result?.downloads.jpg,
+                  `shotlin-${id}-${activeImage?.cameraAngle ?? "master"}.png`,
+                )}
+              >
                 <Icon name="download" /> {hasStoredCandidate ? "Download image" : galleryImages.length > 1 ? `Download ${activeAngleLabel ?? "frame"}` : "Download master"}
-              </a>
+              </button>
+            )}
+            {galleryImages.length > 1 && (
+              <button type="button" className="button button-ghost" disabled={downloadingAll} onClick={downloadAll}>
+                <Icon name="download" /> {downloadingAll ? "Downloading…" : `Download all ${galleryImages.length}`}
+              </button>
             )}
             <Link className="button button-primary" href="/">Generate another</Link>
           </div>
         </div>
+        {downloadError && <p className="error-copy" style={{ marginTop: -12, marginBottom: 12 }}>{downloadError}</p>}
 
         {error ? (
           <section className="panel panel-pad error-panel">
@@ -271,12 +342,26 @@ export default function Job() {
                   </div>
                   {stopReason && <p className="trace-reason">Stopped: {stopReason}</p>}
                   <div className="job-timeline">
-                    {traceSteps.map(([key, label]) => {
+                    {traceSteps.map(([key, label], index) => {
                       const recorded = recordedStates.has(key);
-                      const stateText = recorded ? "completed" : terminalStates.has(state) ? "not run" : "waiting";
+                      // A recorded state only proves the job *entered* that
+                      // phase, not that the work inside it finished — the
+                      // job transitions to "generating" right before the
+                      // image_generate node runs, so a provider failure
+                      // during that call still leaves "generating" in
+                      // stateEvents. Only a *later* step being recorded
+                      // proves this one actually completed; otherwise, if
+                      // the job stopped in a failure state, this is where
+                      // it actually stopped.
+                      const laterStepRecorded = traceSteps.slice(index + 1).some(([laterKey]) => recordedStates.has(laterKey));
+                      const stoppedHere = recorded && !laterStepRecorded && stoppingStates.has(state);
+                      const stateText = !recorded
+                        ? (terminalStates.has(state) ? "not run" : "waiting")
+                        : stoppedHere ? "stopped here" : "completed";
+                      const dotClass = stoppedHere ? "timeline-dot-fail" : recorded ? "" : "timeline-dot-muted";
                       return (
                         <div className="timeline-row" key={key}>
-                          <span className={`timeline-dot ${recorded ? "" : "timeline-dot-muted"}`} />
+                          <span className={`timeline-dot ${dotClass}`} />
                           <span>{label}</span><span className="timeline-time">{stateText}</span>
                         </div>
                       );

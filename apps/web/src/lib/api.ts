@@ -1,10 +1,13 @@
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000";
 
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  // Fastify rejects a request that declares Content-Type: application/json
+  // but sends no body at all ("Body cannot be empty when content-type is
+  // set to 'application/json'") — only set it when there's actually a body.
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
+    headers: init?.body ? { "Content-Type": "application/json", ...(init?.headers ?? {}) } : init?.headers,
   });
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
@@ -16,3 +19,4 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 
 export type CatalogCharacter = { id: string; name: string; description: string | null };
 export type CatalogEnvironment = { id: string; name: string; category: string; promptFragment: string };
+export type CatalogImageModel = { id: string; name: string; notes: string | null };

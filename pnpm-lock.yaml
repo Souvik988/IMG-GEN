@@ -253,6 +253,10 @@ importers:
       zod:
         specifier: ^3.25.0
         version: 3.25.76
+    devDependencies:
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.7(@types/node@22.20.1)(jiti@2.7.0)(lightningcss@1.32.0)(supports-color@8.1.1)(tsx@4.23.12)
 
 packages:
 

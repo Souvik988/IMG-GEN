@@ -1,0 +1,1 @@
+ALTER TABLE "budget_rules" ADD COLUMN "hard_fail_defect_codes" jsonb DEFAULT '[]'::jsonb NOT NULL;

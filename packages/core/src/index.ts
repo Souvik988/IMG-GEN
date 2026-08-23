@@ -14,6 +14,12 @@ export { selectSkills, type SkillMatchContext, type SkillRule } from "./skill-se
 export { compilePrompt, type PromptCompileInput, type CompiledPrompt, } from "./prompt-compiler";
 export { validateImageInput, type ImageValidationResult } from "./input-validation";
 export {
+  rollUpSetDecision,
+  selectDeliverableCandidates,
+  type CandidateOutcome,
+  type SetDecision,
+} from "./candidate-set";
+export {
   CAMERA_ANGLES,
   MAX_ANGLES,
   defaultAngleSet,
@@ -23,3 +29,10 @@ export {
   type CameraAngle,
   type CameraAngleKey,
 } from "./camera-angles";
+export {
+  checkModelCapabilities,
+  parseModelCapabilities,
+  type ModelCapabilities,
+  type GenerationRequestShape,
+  type CapabilityCheckResult,
+} from "./model-capabilities";

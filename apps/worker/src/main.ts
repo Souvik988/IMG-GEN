@@ -6,6 +6,7 @@ import { loadRootEnv } from "@shotlin/database";
 import {
   createGenerationWorker,
   createRedisConnection,
+  createLogger,
 } from "@shotlin/platform";
 import { resolveProviders } from "@shotlin/providers";
 import { createDb } from "@shotlin/database";
@@ -16,6 +17,7 @@ import type { GenerationJobData } from "@shotlin/platform";
 
 loadRootEnv();
 const config = getAppConfig();
+const log = createLogger("worker.main");
 
 // ── Bootstrap dependencies ────────────────────────────────────────────────────
 const { db, pool } = createDb(config.DATABASE_URL, 3);
@@ -32,38 +34,35 @@ const worker: Worker<GenerationJobData> = createGenerationWorker(
   config.REDIS_URL,
   async (job) => {
     const jobId = job.data.jobId;
-    console.log(`[worker] received job ${jobId}`);
+    log.info("received job", { jobId, bullJobId: job.id });
     await processGenerationJob(jobId, deps);
   },
   CONCURRENCY,
 );
 
 worker.on("completed", (job) => {
-  console.log(`[worker] job ${job?.id} completed`);
+  log.info("job completed", { jobId: job?.data?.jobId, bullJobId: job?.id });
 });
 
 worker.on("failed", (job, err) => {
-  console.error(`[worker] job ${job?.id} failed: ${err.message}`);
-  if (err.stack) console.error(err.stack);
+  log.error("job failed", { jobId: job?.data?.jobId, bullJobId: job?.id, error: err.message, stack: err.stack });
 });
 
 worker.on("error", (err) => {
-  console.error("[worker] worker error:", err.message);
+  log.error("worker error", { error: err.message });
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 const shutdown = async () => {
-  console.log("[worker] shutting down...");
+  log.info("shutting down");
   await worker.close();
   await lockRedis.quit();
   await pool.end();
-  console.log("[worker] shutdown complete");
+  log.info("shutdown complete");
   process.exit(0);
 };
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-console.log(
-  `[worker] listening | queue="${config.REDIS_URL}" | concurrency=${CONCURRENCY}`,
-);
+log.info("listening", { queue: config.REDIS_URL, concurrency: CONCURRENCY });

@@ -1,6 +1,8 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Inject,
   NotFoundException,
@@ -8,11 +10,13 @@ import {
   Post,
   Put,
   Query,
+  Req,
   UseGuards,
 } from "@nestjs/common";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import {
   assets,
+  characterIdentityReferences,
   characters,
   costEvents,
   defects,
@@ -32,6 +36,7 @@ import {
 import type { Storage } from "@shotlin/platform";
 import { z } from "zod";
 import { AdminGuard, parseWith } from "../common";
+import type { AuthedRequest } from "../types";
 import { DB, STORAGE, type ApiDb } from "../infrastructure";
 import { AdminService } from "./admin.service";
 
@@ -342,12 +347,17 @@ class AdminCostsController {
 
   @Get()
   async costs() {
-    const [summary, rules] = await Promise.all([
+    const [summary, rules, modelNames] = await Promise.all([
       this.admin.costSummary(),
       this.admin.getBudgetRules(),
+      this.admin.modelNamesById(),
     ]);
     return {
       ...summary,
+      byModel: summary.byModel.map((m) => ({
+        ...m,
+        modelName: m.modelId ? (modelNames[m.modelId]?.name ?? m.modelId) : "Deterministic / no model",
+      })),
       configured: {
         warnInr: Number(rules.warnInr),
         hardStopInr: Number(rules.hardStopInr),
@@ -467,7 +477,10 @@ class AdminOverviewController {
 @Controller("/admin/characters")
 @UseGuards(AdminGuard)
 class AdminCharactersController {
-  constructor(@Inject(DB) private db: ApiDb) {}
+  constructor(
+    @Inject(DB) private db: ApiDb,
+    private admin: AdminService,
+  ) {}
 
   @Get()
   async list() {
@@ -475,46 +488,136 @@ class AdminCharactersController {
   }
 
   @Post()
-  async create(@Body() body: unknown) {
+  async create(@Req() req: AuthedRequest, @Body() body: unknown) {
     const schema = z.object({
       name: z.string().min(1).max(120),
       description: z.string().max(500).optional(),
       attributes: z.record(z.unknown()).default({}),
       isEnabled: z.boolean().default(true),
       sortOrder: z.number().int().default(100),
+      previewAssetId: z.string().uuid().nullable().optional(),
     });
     const input = parseWith(schema, body);
+    if (input.previewAssetId) await this.assertUsableAsset(input.previewAssetId);
     const [row] = await this.db
       .insert(characters)
       .values({ ...input, isPreset: true, description: input.description ?? null })
       .returning();
+    await this.admin.audit(req.user!.id, "character.create", "character", row.id, input);
     return { character: row };
   }
 
   @Put("/:id")
-  async update(@Param("id") id: string, @Body() body: unknown) {
+  async update(@Req() req: AuthedRequest, @Param("id") id: string, @Body() body: unknown) {
     const schema = z.object({
       name: z.string().min(1).max(120).optional(),
       description: z.string().max(500).nullable().optional(),
       attributes: z.record(z.unknown()).optional(),
       isEnabled: z.boolean().optional(),
       sortOrder: z.number().int().optional(),
+      previewAssetId: z.string().uuid().nullable().optional(),
     });
     const input = parseWith(schema, body);
+    if (input.previewAssetId) await this.assertUsableAsset(input.previewAssetId);
     const [row] = await this.db
       .update(characters)
       .set(input)
       .where(eq(characters.id, id))
       .returning();
     if (!row) throw new NotFoundException("Character not found");
+    await this.admin.audit(req.user!.id, "character.update", "character", id, input);
     return { character: row };
+  }
+
+  /**
+   * Reference photos are uploaded through the generic /uploads presign flow
+   * (kind: "character_reference") before being attached here. Reject
+   * anything that hasn't cleared that pipeline's validation, so a broken or
+   * rejected upload can never silently become a catalog character's
+   * identity lock.
+   */
+  private async assertUsableAsset(assetId: string) {
+    const [asset] = await this.db.select().from(assets).where(eq(assets.id, assetId)).limit(1);
+    if (!asset) throw new NotFoundException("Asset not found");
+    if (asset.validationStatus !== "usable") {
+      throw new BadRequestException(
+        `Asset ${assetId} is not usable (status: ${asset.validationStatus}) — complete upload validation first`,
+      );
+    }
+  }
+
+  /** The structured identity pack — up to one photo per angle role. */
+  @Get("/:id/identity-references")
+  async listIdentityReferences(@Param("id") id: string) {
+    const rows = await this.db
+      .select()
+      .from(characterIdentityReferences)
+      .where(eq(characterIdentityReferences.characterId, id));
+    return { identityReferences: rows };
+  }
+
+  @Put("/:id/identity-references/:role")
+  async setIdentityReference(
+    @Req() req: AuthedRequest,
+    @Param("id") id: string,
+    @Param("role") role: string,
+    @Body() body: unknown,
+  ) {
+    const roleSchema = z.enum(["front", "three_quarter", "full_body"]);
+    const parsedRole = roleSchema.safeParse(role);
+    if (!parsedRole.success) {
+      throw new BadRequestException("role must be one of: front, three_quarter, full_body");
+    }
+    const input = parseWith(z.object({ assetId: z.string().uuid() }), body);
+    await this.assertUsableAsset(input.assetId);
+
+    const [char] = await this.db.select().from(characters).where(eq(characters.id, id)).limit(1);
+    if (!char) throw new NotFoundException("Character not found");
+
+    const [row] = await this.db
+      .insert(characterIdentityReferences)
+      .values({ characterId: id, role: parsedRole.data, assetId: input.assetId })
+      .onConflictDoUpdate({
+        target: [characterIdentityReferences.characterId, characterIdentityReferences.role],
+        set: { assetId: input.assetId },
+      })
+      .returning();
+    await this.admin.audit(req.user!.id, "character.identity_reference.set", "character", id, {
+      role: parsedRole.data,
+      assetId: input.assetId,
+    });
+    return { identityReference: row };
+  }
+
+  @Delete("/:id/identity-references/:role")
+  async removeIdentityReference(@Req() req: AuthedRequest, @Param("id") id: string, @Param("role") role: string) {
+    const roleSchema = z.enum(["front", "three_quarter", "full_body"]);
+    const parsedRole = roleSchema.safeParse(role);
+    if (!parsedRole.success) {
+      throw new BadRequestException("role must be one of: front, three_quarter, full_body");
+    }
+    await this.db
+      .delete(characterIdentityReferences)
+      .where(
+        and(
+          eq(characterIdentityReferences.characterId, id),
+          eq(characterIdentityReferences.role, parsedRole.data),
+        ),
+      );
+    await this.admin.audit(req.user!.id, "character.identity_reference.remove", "character", id, {
+      role: parsedRole.data,
+    });
+    return { ok: true };
   }
 }
 
 @Controller("/admin/environments")
 @UseGuards(AdminGuard)
 class AdminEnvironmentsController {
-  constructor(@Inject(DB) private db: ApiDb) {}
+  constructor(
+    @Inject(DB) private db: ApiDb,
+    private admin: AdminService,
+  ) {}
 
   @Get()
   async list() {
@@ -527,7 +630,7 @@ class AdminEnvironmentsController {
   }
 
   @Post()
-  async create(@Body() body: unknown) {
+  async create(@Req() req: AuthedRequest, @Body() body: unknown) {
     const schema = z.object({
       key: z.string().min(1).max(60).regex(/^[a-z0-9-]+$/),
       name: z.string().min(1).max(120),
@@ -542,11 +645,12 @@ class AdminEnvironmentsController {
       .insert(environmentPresets)
       .values({ ...input, description: input.description ?? null })
       .returning();
+    await this.admin.audit(req.user!.id, "environment.create", "environment", row.id, input);
     return { environment: row };
   }
 
   @Put("/:id")
-  async update(@Param("id") id: string, @Body() body: unknown) {
+  async update(@Req() req: AuthedRequest, @Param("id") id: string, @Body() body: unknown) {
     const schema = z.object({
       name: z.string().min(1).max(120).optional(),
       category: z.string().min(1).max(60).optional(),
@@ -562,6 +666,7 @@ class AdminEnvironmentsController {
       .where(eq(environmentPresets.id, id))
       .returning();
     if (!row) throw new NotFoundException("Environment not found");
+    await this.admin.audit(req.user!.id, "environment.update", "environment", id, input);
     return { environment: row };
   }
 }

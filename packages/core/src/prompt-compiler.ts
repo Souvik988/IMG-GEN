@@ -1,6 +1,6 @@
 /**
  * Prompt compiler — template-first, Layer A/B/C/D architecture.
- * Deterministic ordering + hard character limit.
+ * Deterministic ordering + priority-aware budgeting.
  */
 
 export type PromptCompileInput = {
@@ -31,27 +31,69 @@ export type CompiledPrompt = {
   };
   /** Whether the prompt was truncated to fit. */
   truncated: boolean;
+  /** Diagnostic metadata for how the budget was allocated. */
+  budget: {
+    totalBudget: number;
+    usedBudget: number;
+    includedLayers: string[];
+    omittedSkills: number;
+    compressedLayers: string[];
+    /**
+     * False only when facts and/or repair instruction — the layers that must
+     * never be silently dropped — had to be cut to fit maxChars. This can
+     * only happen when those mandatory layers alone exceed the whole budget;
+     * skills are always sacrificed first.
+     */
+    mandatoryLayerPreserved: boolean;
+  };
 };
 
 /**
  * Compile the generation prompt.
  * Order: system → facts → skills → repair
- * Skills are individually capped and collectively budgeted.
- * The system prompt variable {{compiledPrompt}} is replaced with the rest.
+ *
+ * Budgeting is priority-aware, not a blind end-of-string slice: facts (Layer
+ * C, garment identity + protected details) and the repair instruction
+ * (Layer D, the retry correction) are reserved for first and trimmed last.
+ * Skills (Layer B) are the lowest-priority, most-decorative layer and are
+ * cut first — individually, never partially — when the budget is tight.
+ * Only if facts + repair instruction cannot fit even with zero skills does
+ * the compiler fall back to truncating those mandatory layers, and it flags
+ * that explicitly via `budget.mandatoryLayerPreserved`.
  */
 export function compilePrompt(input: PromptCompileInput): CompiledPrompt {
-  const parts: string[] = [];
+  const repairText = input.repairInstruction
+    ? "REPAIR INSTRUCTION: " + input.repairInstruction
+    : "";
 
-  // Layer C: facts (most structured, always compact).
-  parts.push(input.facts);
+  // Static system-prompt characters that aren't the injected body — the
+  // wrapper text always survives regardless of the placeholder's position.
+  const hasPlaceholder = input.systemPrompt.includes("{{compiledPrompt}}");
+  const staticSystemChars = hasPlaceholder
+    ? input.systemPrompt.length - "{{compiledPrompt}}".length
+    : input.systemPrompt.length;
 
-  // Layer B: skills — each individually capped, total budget enforced.
-  let skillBudgetRemaining = input.skillCharBudget;
+  // Mandatory layers (facts + repair) get first claim on the budget. Skills
+  // only ever spend what's left over.
+  const separatorChars = repairText ? 4 : 2; // "\n\n" between parts, roughly
+  const mandatoryChars = staticSystemChars + input.facts.length + repairText.length + separatorChars;
+  const skillBudgetAvailable = Math.max(0, Math.min(input.skillCharBudget, input.maxChars - mandatoryChars));
+
+  const parts: string[] = [input.facts];
+
+  let skillBudgetRemaining = skillBudgetAvailable;
   const skillParts: string[] = [];
+  let omittedSkills = 0;
   for (const instr of input.skillInstructions) {
-    if (skillBudgetRemaining <= 0) break;
+    if (skillBudgetRemaining <= 0) {
+      omittedSkills += 1;
+      continue;
+    }
     // Skip skills that don't fit entirely — partial instructions are worse than omission.
-    if (instr.length > skillBudgetRemaining) continue;
+    if (instr.length > skillBudgetRemaining) {
+      omittedSkills += 1;
+      continue;
+    }
     skillParts.push(instr);
     skillBudgetRemaining -= instr.length;
   }
@@ -59,32 +101,41 @@ export function compilePrompt(input: PromptCompileInput): CompiledPrompt {
     parts.push("SKILL INSTRUCTIONS:\n" + skillParts.join("\n\n"));
   }
 
-  // Layer D: repair (retry only).
-  if (input.repairInstruction) {
-    parts.push("REPAIR INSTRUCTION: " + input.repairInstruction);
-  }
+  if (repairText) parts.push(repairText);
 
   const compiledBody = parts.join("\n\n");
 
-  // Layer A: system prompt — substitute {{compiledPrompt}} if present.
-  let systemLayer = input.systemPrompt;
-  if (systemLayer.includes("{{compiledPrompt}}")) {
-    systemLayer = systemLayer.replace("{{compiledPrompt}}", compiledBody);
-  } else {
-    systemLayer = input.systemPrompt + "\n\n" + compiledBody;
-  }
+  let systemLayer = hasPlaceholder
+    ? input.systemPrompt.replace("{{compiledPrompt}}", compiledBody)
+    : input.systemPrompt + "\n\n" + compiledBody;
 
-  const repairSize = input.repairInstruction ? input.repairInstruction.length : 0;
+  const repairSize = repairText.length;
   const skillSize = skillParts.join("").length;
   const factsSize = input.facts.length;
 
-  // Truncate at maxChars if needed.
+  const compressedLayers: string[] = [];
   let truncated = false;
+  let mandatoryLayerPreserved = true;
   let finalPrompt = systemLayer;
+
   if (finalPrompt.length > input.maxChars) {
+    // Skills were already budgeted to fit, so overflow here means the
+    // mandatory layers (system + facts + repair) alone exceed maxChars —
+    // an edge case, not the common path. There is no safe semantic trim to
+    // apply to caller-supplied facts/repair text from inside this function,
+    // so the last resort is an end slice, same as before — but now it's
+    // clearly flagged rather than silently indistinguishable from the
+    // common "skills got cut" case.
     finalPrompt = finalPrompt.slice(0, input.maxChars);
     truncated = true;
+    mandatoryLayerPreserved = false;
+    compressedLayers.push("facts_or_repair");
   }
+
+  const includedLayers = ["system", "facts"];
+  if (skillParts.length > 0) includedLayers.push("skills");
+  if (repairText) includedLayers.push("repair");
+  if (omittedSkills > 0) compressedLayers.push("skills");
 
   return {
     prompt: finalPrompt,
@@ -96,5 +147,13 @@ export function compilePrompt(input: PromptCompileInput): CompiledPrompt {
       total: finalPrompt.length,
     },
     truncated,
+    budget: {
+      totalBudget: input.maxChars,
+      usedBudget: finalPrompt.length,
+      includedLayers,
+      omittedSkills,
+      compressedLayers,
+      mandatoryLayerPreserved,
+    },
   };
 }

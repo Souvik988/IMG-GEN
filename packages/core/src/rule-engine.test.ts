@@ -4,6 +4,7 @@ import type { QualityReview } from "./schemas/quality-review";
 
 function makeReview(overrides: Partial<QualityReview["scores"]> & {
   criticalDefects?: QualityReview["criticalDefects"];
+  minorDefects?: QualityReview["minorDefects"];
   confidence?: number;
 } = {}): QualityReview {
   return {
@@ -20,7 +21,7 @@ function makeReview(overrides: Partial<QualityReview["scores"]> & {
       ...overrides,
     },
     criticalDefects: overrides.criticalDefects ?? [],
-    minorDefects: [],
+    minorDefects: overrides.minorDefects ?? [],
     repairInstruction: "",
     confidence: overrides.confidence ?? 85,
   };
@@ -68,5 +69,50 @@ describe("rule engine", () => {
   it("returns garmentScore", () => {
     const r = evaluateRules(makeReview({ garmentFidelity: 91 }));
     expect(r.garmentScore).toBe(91);
+  });
+
+  it("FAILs a minor defect whose code is on the hard-fail list, even with otherwise passing scores", () => {
+    // This is the actual value of hardFailDefectCodes: some defect types
+    // must always fail regardless of the reviewer's own severity call.
+    const config: RuleConfig = { ...DEFAULT_RULE_CONFIG, hardFailDefectCodes: ["LOGO_CHANGED"] };
+    const r = evaluateRules(
+      makeReview({
+        minorDefects: [{ code: "LOGO_CHANGED", description: "Brand logo altered", repairHint: "Restore original logo" }],
+      }),
+      config,
+    );
+    expect(r.decision).toBe("FAIL");
+    expect(r.reasons[0]).toContain("LOGO_CHANGED");
+  });
+
+  it("does not FAIL a minor defect whose code is NOT on the hard-fail list", () => {
+    const config: RuleConfig = { ...DEFAULT_RULE_CONFIG, hardFailDefectCodes: ["LOGO_CHANGED"] };
+    const r = evaluateRules(
+      makeReview({
+        minorDefects: [{ code: "minor_wrinkle", description: "Small fabric wrinkle", repairHint: "n/a" }],
+      }),
+      config,
+    );
+    expect(r.decision).toBe("PASS");
+  });
+
+  it("an empty hardFailDefectCodes list does not hard-fail any minor defect", () => {
+    const r = evaluateRules(
+      makeReview({
+        minorDefects: [{ code: "LOGO_CHANGED", description: "Brand logo altered", repairHint: "n/a" }],
+      }),
+    );
+    expect(r.decision).toBe("PASS");
+  });
+
+  it("still FAILs on critical defects when hardFailDefectCodes is configured (critical always wins)", () => {
+    const config: RuleConfig = { ...DEFAULT_RULE_CONFIG, hardFailDefectCodes: ["LOGO_CHANGED"] };
+    const r = evaluateRules(
+      makeReview({
+        criticalDefects: [{ code: "some_other_code", description: "Unrelated critical issue", repairHint: "n/a" }],
+      }),
+      config,
+    );
+    expect(r.decision).toBe("FAIL");
   });
 });

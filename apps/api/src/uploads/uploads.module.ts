@@ -100,39 +100,44 @@ class UploadsService {
       throw new BadRequestException("Uploaded object not found — upload first");
     }
 
-    // Fetch the bytes for deep validation (decode + blur).
-    const buffer = await this.storage.getObject(asset.bucket, asset.objectKey);
-    const checksum = createHash("sha256").update(buffer).digest("hex");
-
     const report: Record<string, unknown> = {};
     let usable = true;
     let width: number | null = null;
     let height: number | null = null;
+    let checksum: string | null = null;
 
-    try {
-      const meta = await extractImageMeta(buffer);
-      width = meta.width;
-      height = meta.height;
-      report.width = meta.width;
-      report.height = meta.height;
-      report.detectedMimeType = meta.mimeType;
-      report.blurVariance = meta.blurVariance != null ? Math.round(meta.blurVariance) : null;
-
-      if (meta.mimeType !== asset.mimeType) {
-        usable = false;
-        report.reason = `Detected type ${meta.mimeType} does not match declared ${asset.mimeType}`;
-      }
-      if (meta.width < 128 || meta.height < 128) {
-        usable = false;
-        report.reason = "Image too small (min 128px)";
-      }
-      if (head.contentLength > 26_214_400) {
-        usable = false;
-        report.reason = "File exceeds 25MB limit";
-      }
-    } catch (err) {
+    // Check size from the HEAD response before ever downloading or decoding
+    // the object — an oversized file (or a decompression-bomb-style image
+    // that's small on disk but huge decoded) should never reach `sharp` just
+    // to be rejected a moment later.
+    if (head.contentLength > 26_214_400) {
       usable = false;
-      report.reason = `Corrupted or undecodable image: ${(err as Error).message}`;
+      report.reason = "File exceeds 25MB limit";
+    } else {
+      const buffer = await this.storage.getObject(asset.bucket, asset.objectKey);
+      checksum = createHash("sha256").update(buffer).digest("hex");
+
+      try {
+        const meta = await extractImageMeta(buffer);
+        width = meta.width;
+        height = meta.height;
+        report.width = meta.width;
+        report.height = meta.height;
+        report.detectedMimeType = meta.mimeType;
+        report.blurVariance = meta.blurVariance != null ? Math.round(meta.blurVariance) : null;
+
+        if (meta.mimeType !== asset.mimeType) {
+          usable = false;
+          report.reason = `Detected type ${meta.mimeType} does not match declared ${asset.mimeType}`;
+        }
+        if (meta.width < 128 || meta.height < 128) {
+          usable = false;
+          report.reason = "Image too small (min 128px)";
+        }
+      } catch (err) {
+        usable = false;
+        report.reason = `Corrupted or undecodable image: ${(err as Error).message}`;
+      }
     }
 
     // Originals stay immutable; only validation fields update.

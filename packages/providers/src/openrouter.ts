@@ -25,6 +25,56 @@ function buildUserContent(text: string, images: ImageInput[]): ContentPart[] {
   return parts;
 }
 
+/**
+ * Repairs the single most common way LLM JSON output breaks: a string value
+ * (often a free-text array element) contains a literal, unescaped `"`
+ * instead of `\"`. A raw `"` inside a string terminates it early, and
+ * whatever follows the "real" closing quote reads as a syntax error
+ * (typically "Expected ',' or ']'/'}' after ..."). Re-scans the text
+ * tracking string/escape state; a `"` encountered mid-string is only
+ * treated as a real closing quote when the next non-whitespace character is
+ * a JSON structural delimiter (`,` `}` `]` `:`) or end of input — otherwise
+ * it's escaped and the string continues.
+ */
+function repairUnescapedQuotes(json: string): string {
+  let result = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+    if (!inString) {
+      result += ch;
+      if (ch === '"') inString = true;
+      continue;
+    }
+    if (escaped) {
+      result += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      result += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < json.length && /\s/.test(json[j])) j++;
+      const next = json[j];
+      const isRealClose = next === undefined || ",}]:".includes(next);
+      if (isRealClose) {
+        result += ch;
+        inString = false;
+      } else {
+        result += '\\"';
+      }
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
+
 /** Extract the first JSON object from model text (handles code fences / prose). */
 export function extractJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -34,7 +84,16 @@ export function extractJson(text: string): unknown {
   if (start === -1 || end === -1 || end <= start) {
     throw new ProviderError("No JSON object found in model output", "openrouter");
   }
-  return JSON.parse(candidate.slice(start, end + 1));
+  const raw = candidate.slice(start, end + 1);
+  try {
+    return JSON.parse(raw);
+  } catch (err) {
+    try {
+      return JSON.parse(repairUnescapedQuotes(raw));
+    } catch {
+      throw err;
+    }
+  }
 }
 
 type OpenRouterResponse = {
@@ -303,10 +362,7 @@ export async function openRouterGenerateImage(
   const requestedResolution = input.model.modelId === "bytedance-seed/seedream-4.5" && input.resolution === "1k"
     ? "2K"
     : resolution[input.resolution] ?? "1K";
-  const references = [
-    ...input.references,
-    ...(input.characterReference ? [input.characterReference] : []),
-  ];
+  const references = [...input.references, ...(input.characterReferences ?? [])];
   const response = await callOpenRouterImages(
     apiKey,
     {

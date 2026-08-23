@@ -20,6 +20,7 @@ import { z } from "zod";
 import { AuthGuard, hashSessionToken, parseWith } from "../common";
 import type { AuthedRequest, Reply } from "../types";
 import { DB, type ApiDb } from "../infrastructure";
+import { AuthRateLimitGuard } from "./auth-rate-limit.guard";
 
 const registerSchema = z.object({
   email: z.string().email(),
@@ -35,12 +36,15 @@ const loginSchema = z.object({
 const SESSION_COOKIE = "shotlin_session";
 
 function setSessionCookie(reply: Reply, token: string) {
+  const config = getAppConfig();
   reply.setCookie(SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: false, // local MVP over http
+    // Local dev runs over plain http, where a Secure cookie would never be
+    // sent back — only require it once the app is actually deployed.
+    secure: config.NODE_ENV === "production",
     path: "/",
-    maxAge: getAppConfig().SESSION_TTL_HOURS * 3600,
+    maxAge: config.SESSION_TTL_HOURS * 3600,
   });
 }
 
@@ -120,6 +124,7 @@ class AuthController {
   constructor(private service: AuthService) {}
 
   @Post("/register")
+  @UseGuards(AuthRateLimitGuard)
   async register(@Body() body: unknown, @Res({ passthrough: true }) reply: Reply) {
     const user = await this.service.register(body);
     const token = await this.service.createSession(user.id);
@@ -128,6 +133,7 @@ class AuthController {
   }
 
   @Post("/login")
+  @UseGuards(AuthRateLimitGuard)
   async login(@Body() body: unknown, @Res({ passthrough: true }) reply: Reply) {
     const user = await this.service.login(body);
     const token = await this.service.createSession(user.id);
@@ -154,7 +160,7 @@ class AuthController {
 
 @Module({
   controllers: [AuthController],
-  providers: [AuthService, AuthGuard],
+  providers: [AuthService, AuthGuard, AuthRateLimitGuard],
   exports: [AuthService, AuthGuard],
 })
 export class AuthModule {}

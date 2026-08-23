@@ -28,12 +28,15 @@ const boolFlag = z.preprocess(
   z.enum(["true", "false"]).transform((v) => v === "true"),
 );
 
+const INSECURE_SESSION_SECRETS = new Set(["dev-secret", "change-me-to-a-long-random-string", ""]);
+
 const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   DATABASE_URL: z.string(),
   REDIS_URL: z.string().default("redis://localhost:6381"),
   API_PORT: z.coerce.number().default(4000),
   API_URL: z.string().default("http://localhost:4000"),
-  WEB_URL: z.string().default("http://localhost:3100"),
+  WEB_URL: z.string().url().default("http://localhost:3100"),
   S3_ENDPOINT: z.string().default("http://localhost:9000"),
   S3_REGION: z.string().default("us-east-1"),
   S3_ACCESS_KEY: z.string(),
@@ -62,6 +65,17 @@ export function getAppConfig(): AppConfig {
       .map((i) => `${i.path.join(".")}: ${i.message}`)
       .join("; ");
     throw new Error(`Invalid environment configuration: ${issues}`);
+  }
+  // A known/default/empty session secret is safe only in local dev — in
+  // production it lets anyone forge a valid session cookie. Refuse to boot
+  // rather than silently run with a guessable secret.
+  if (
+    parsed.data.NODE_ENV === "production" &&
+    (INSECURE_SESSION_SECRETS.has(parsed.data.SESSION_SECRET) || parsed.data.SESSION_SECRET.length < 32)
+  ) {
+    throw new Error(
+      "Refusing to boot in production: SESSION_SECRET is missing, uses a known default, or is shorter than 32 characters. Set a long random SESSION_SECRET before deploying.",
+    );
   }
   cached = parsed.data;
   return cached;

@@ -22,6 +22,7 @@ import {
   budgetRules,
   characters,
   environmentPresets,
+  executionManifests,
   feedback,
   generationCandidates,
   jobAttempts,
@@ -29,6 +30,12 @@ import {
   jobOutputs,
   jobStateEvents,
   jobs,
+  modelRegistry,
+  promptVersions,
+  skillRules,
+  skillVersions,
+  workflowNodeConfigs,
+  workflowNodes,
   workflowVersions,
   workflows,
 } from "@shotlin/database";
@@ -46,9 +53,17 @@ import {
 } from "../infrastructure";
 import { AuthModule } from "../auth/auth.module";
 
+/** The transaction handle drizzle passes into `db.transaction(async (tx) => ...)`. */
+type ApiTx = Parameters<Parameters<ApiDb["transaction"]>[0]>[0];
+
+const detailKindSchema = z.enum(["border", "embroidery", "pattern", "neckline", "sleeve", "pallu", "other"]);
+
 const createJobSchema = z.object({
   mainGarmentAssetId: z.string().uuid(),
-  detailAssetIds: z.array(z.string().uuid()).max(5).default([]),
+  detailReferences: z
+    .array(z.object({ assetId: z.string().uuid(), kind: detailKindSchema.default("other") }))
+    .max(5)
+    .default([]),
   inputType: z.enum(["photo", "drawing", "design_reference"]).default("photo"),
   characterId: z.string().uuid().nullable().optional(),
   characterAssetId: z.string().uuid().nullable().optional(),
@@ -57,6 +72,8 @@ const createJobSchema = z.object({
   heightAppearance: z.string().min(1).max(60).default("average"),
   pose: z.enum(["auto", "standing", "walking", "closeup"]).default("auto"),
   environmentPresetId: z.string().uuid().nullable().optional(),
+  /** Explicit image-generation model choice. Null/omitted = use the production workflow's configured default. */
+  imageModelId: z.string().uuid().nullable().optional(),
   resolution: z.enum(["1k", "2k", "4k"]).default("2k"),
   aspectRatio: z.enum(["portrait", "square", "landscape"]).default("portrait"),
   outputCount: z.number().int().min(1).max(MAX_ANGLES).default(1),
@@ -100,7 +117,7 @@ class JobsService {
     }
 
     // ---- validate assets belong to the user and are usable ----
-    const assetIds = [input.mainGarmentAssetId, ...input.detailAssetIds];
+    const assetIds = [input.mainGarmentAssetId, ...input.detailReferences.map((d) => d.assetId)];
     if (input.characterAssetId) assetIds.push(input.characterAssetId);
     const assetRows = await this.db
       .select()
@@ -129,7 +146,11 @@ class JobsService {
 
     // ---- snapshot the production workflow version ----
     const wfRows = await this.db
-      .select({ versionId: workflowVersions.id })
+      .select({
+        versionId: workflowVersions.id,
+        workflowId: workflows.id,
+        versionNumber: workflowVersions.version,
+      })
       .from(workflows)
       .innerJoin(workflowVersions, eq(workflowVersions.workflowId, workflows.id))
       .where(and(eq(workflows.key, "default"), eq(workflowVersions.status, "production")))
@@ -138,6 +159,8 @@ class JobsService {
     if (!workflowVersionId) {
       throw new BadRequestException("No production workflow configured");
     }
+    const workflowId = wfRows[0].workflowId;
+    const workflowVersionNumber = wfRows[0].versionNumber;
 
     // ---- character / environment checks ----
     if (input.characterId) {
@@ -155,6 +178,20 @@ class JobsService {
         .where(eq(environmentPresets.id, input.environmentPresetId))
         .limit(1);
       if (e.length === 0) throw new BadRequestException("Environment preset not found");
+    }
+    if (input.imageModelId) {
+      const m = await this.db
+        .select({ id: modelRegistry.id })
+        .from(modelRegistry)
+        .where(
+          and(
+            eq(modelRegistry.id, input.imageModelId),
+            eq(modelRegistry.role, "image_generator"),
+            eq(modelRegistry.isEnabled, true),
+          ),
+        )
+        .limit(1);
+      if (m.length === 0) throw new BadRequestException("Selected image model is not available");
     }
 
     const selections: Record<string, unknown> = {
@@ -178,6 +215,7 @@ class JobsService {
             aspectRatio: input.aspectRatio,
             outputCount: input.outputCount,
             cameraAngles: resolveAngleSet(input.outputCount, input.cameraAngles),
+            imageModelId: input.imageModelId ?? null,
             idempotencyKey: key,
             idempotencyFingerprint: fingerprint,
             characterId: input.characterId ?? null,
@@ -190,14 +228,29 @@ class JobsService {
           jobId: string;
           assetId: string;
           role: "main_garment" | "detail" | "character";
+          detailKind?: (typeof detailKindSchema)["_type"];
         }> = [
           { jobId: inserted.id, assetId: input.mainGarmentAssetId, role: "main_garment" as const },
-          ...input.detailAssetIds.map((id) => ({ jobId: inserted.id, assetId: id, role: "detail" as const })),
+          ...input.detailReferences.map((d) => ({
+            jobId: inserted.id,
+            assetId: d.assetId,
+            role: "detail" as const,
+            detailKind: d.kind,
+          })),
         ];
         if (input.characterAssetId) {
           inputRows.push({ jobId: inserted.id, assetId: input.characterAssetId, role: "character" as const });
         }
         await tx.insert(jobInputsTable).values(inputRows);
+
+        await this.createExecutionManifest(tx, {
+          jobId: inserted.id,
+          workflowId,
+          workflowVersionId,
+          workflowVersionNumber,
+          imageModelId: inserted.imageModelId,
+        });
+
         return [inserted] as const;
       });
     } catch (error) {
@@ -218,6 +271,131 @@ class JobsService {
     await this.queue.add("generate", { jobId: job.id }, { jobId: job.id });
 
     return { job: this.toCustomerJob(job) };
+  }
+
+  /**
+   * Snapshot every runtime-relevant configuration setting for this job at
+   * creation time — workflow nodes, model bindings, prompt versions, skill
+   * versions, quality thresholds, budget rules, FX rate — into an immutable
+   * record. Written inside the same transaction as the job row so job
+   * creation and its manifest either both commit or both roll back.
+   */
+  private async createExecutionManifest(
+    tx: ApiTx,
+    input: {
+      jobId: string;
+      workflowId: string;
+      workflowVersionId: string;
+      workflowVersionNumber: number;
+      imageModelId: string | null;
+    },
+  ): Promise<void> {
+    const nodes = await tx
+      .select()
+      .from(workflowNodes)
+      .where(eq(workflowNodes.workflowVersionId, input.workflowVersionId))
+      .orderBy(workflowNodes.sequence);
+    const configs = await tx.select().from(workflowNodeConfigs);
+    const configByNodeId = new Map(configs.map((c) => [c.nodeId, c]));
+
+    const nodesSnapshot = nodes.map((n) => {
+      const config = configByNodeId.get(n.id);
+      return {
+        nodeKey: n.nodeKey,
+        sequence: n.sequence,
+        isEnabled: n.isEnabled,
+        modelId: config?.modelId ?? null,
+        promptVersionId: config?.promptVersionId ?? null,
+        timeoutMs: config?.timeoutMs ?? null,
+        maxRetries: config?.maxRetries ?? null,
+        thresholds: config?.thresholds ?? {},
+        settings: config?.settings ?? {},
+      };
+    });
+
+    const models = await tx.select().from(modelRegistry).where(eq(modelRegistry.isEnabled, true));
+    const modelsSnapshot: Record<string, { modelRegistryId: string; provider: string; providerModelId: string }> =
+      Object.fromEntries(
+        models.map((m) => [m.role, { modelRegistryId: m.id, provider: m.provider, providerModelId: m.modelId }]),
+      );
+    // Mirrors loadJobData's override in the worker — a customer's explicit
+    // model choice takes precedence over the workflow's default binding.
+    if (input.imageModelId) {
+      const [chosen] = await tx.select().from(modelRegistry).where(eq(modelRegistry.id, input.imageModelId)).limit(1);
+      if (chosen) {
+        modelsSnapshot[chosen.role] = { modelRegistryId: chosen.id, provider: chosen.provider, providerModelId: chosen.modelId };
+      }
+    }
+
+    const skills = await tx.select().from(skillVersions).where(eq(skillVersions.status, "production"));
+    const rules = await tx.select().from(skillRules).where(eq(skillRules.isEnabled, true));
+    const skillsSnapshot = rules
+      .map((r) => {
+        // Each rule belongs to a skill (not a specific version); resolve it
+        // to that skill's current production version, same as the worker.
+        const version = skills.find((s) => s.skillId === r.skillId);
+        if (!version) return null;
+        return {
+          skillId: version.skillId,
+          skillVersionId: version.id,
+          priority: version.priority,
+          instructionHash: createHash("sha256").update(version.instruction).digest("hex").slice(0, 16),
+        };
+      })
+      .filter((s): s is NonNullable<typeof s> => s !== null);
+
+    const promptVersionIds = [
+      ...new Set(nodesSnapshot.map((n) => n.promptVersionId).filter((id): id is string => id !== null)),
+    ];
+    const prompts = promptVersionIds.length
+      ? await tx.select().from(promptVersions).where(inArray(promptVersions.id, promptVersionIds))
+      : [];
+    const promptsById = new Map(prompts.map((p) => [p.id, { promptId: p.promptId, version: p.version }]));
+
+    const [budget] = await tx.select().from(budgetRules).limit(1);
+    if (!budget) throw new Error("Budget rules not seeded");
+
+    const qualityRulesSnapshot = {
+      minGarmentFidelity: budget.minGarmentFidelity,
+      minCharacterIdentity: budget.minCharacterIdentity,
+      minPhotorealism: budget.minPhotorealism,
+      minAnatomy: budget.minAnatomy,
+      minTechnicalQuality: budget.minTechnicalQuality,
+      uncertaintyBand: budget.uncertaintyBand,
+      minReviewerConfidence: budget.minReviewerConfidence,
+    };
+    const budgetRulesSnapshot = {
+      hardStopInr: budget.hardStopInr,
+      warnInr: budget.warnInr,
+      maxAttempts: budget.maxAttempts,
+      isSecondReviewEnabled: budget.isSecondReviewEnabled,
+    };
+
+    const canonical = JSON.stringify({
+      workflowVersionId: input.workflowVersionId,
+      nodesSnapshot,
+      modelsSnapshot,
+      skillsSnapshot,
+      qualityRulesSnapshot,
+      budgetRulesSnapshot,
+      promptsById: Object.fromEntries(promptsById),
+      fxRate: budget.usdInrRate,
+    });
+    const manifestHash = createHash("sha256").update(canonical).digest("hex");
+
+    await tx.insert(executionManifests).values({
+      jobId: input.jobId,
+      workflowId: input.workflowId,
+      workflowVersionId: input.workflowVersionId,
+      workflowVersionNumber: input.workflowVersionNumber,
+      nodesSnapshot,
+      modelsSnapshot,
+      skillsSnapshot,
+      qualityRulesSnapshot,
+      budgetRulesSnapshot,
+      fxRate: String(budget.usdInrRate ?? 95.78),
+      manifestHash,
+    });
   }
 
   private async replayIdempotentJob(job: typeof jobs.$inferSelect) {

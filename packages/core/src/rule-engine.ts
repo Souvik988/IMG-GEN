@@ -44,24 +44,27 @@ export function evaluateRules(
   review: QualityReview,
   config: RuleConfig = DEFAULT_RULE_CONFIG,
 ): RuleResult {
-  const { scores, criticalDefects, confidence } = review;
+  const { scores, criticalDefects, minorDefects, confidence } = review;
   const reasons: string[] = [];
 
-  // Hard-fail: any critical defect with a code in the admin blocklist.
+  // Any defect the reviewer itself classified as critical is an automatic
+  // FAIL, independent of aggregate score.
   for (const d of criticalDefects) {
-    if (config.hardFailDefectCodes.length === 0 || config.hardFailDefectCodes.includes(d.code)) {
-      reasons.push(`Critical defect: ${d.code} — ${d.description}`);
-    }
-  }
-  if (reasons.length > 0) {
-    return { decision: "FAIL", reasons, garmentScore: scores.garmentFidelity };
+    reasons.push(`Critical defect: ${d.code} — ${d.description}`);
   }
 
-  // Any critical defect (even without blocklist) also causes FAIL.
-  if (criticalDefects.length > 0) {
-    for (const d of criticalDefects) {
-      reasons.push(`Critical defect: ${d.code} — ${d.description}`);
+  // Hard-fail codes are a system-level override on top of the reviewer's own
+  // judgment: some defect types (wrong garment color, changed logo, broken
+  // anatomy, ...) must always fail even if this particular reviewer call
+  // classified them as minor. This is what makes hardFailDefectCodes
+  // meaningful — critical defects already fail regardless of this list.
+  for (const d of minorDefects) {
+    if (config.hardFailDefectCodes.includes(d.code)) {
+      reasons.push(`Hard-fail defect (configured as always-critical): ${d.code} — ${d.description}`);
     }
+  }
+
+  if (reasons.length > 0) {
     return { decision: "FAIL", reasons, garmentScore: scores.garmentFidelity };
   }
 

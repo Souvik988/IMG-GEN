@@ -2,7 +2,7 @@
  * Worker-side database helpers.
  */
 
-import { eq, and } from "drizzle-orm";
+import { eq, and, ne, sql } from "drizzle-orm";
 import type { Db } from "@shotlin/database";
 import * as schema from "@shotlin/database";
 import {
@@ -23,6 +23,7 @@ import {
   modelRegistry,
   promptVersions,
   qualityReviews,
+  retryPlans,
   skillRules,
   skillVersions,
   workflowNodeConfigs,
@@ -37,7 +38,9 @@ import type {
   JobAttempt,
   JobOutput,
   JobStepRun,
+  ModelRegistry,
   QualityReviewRow,
+  RetryPlan,
   WorkflowNode,
   WorkflowNodeConfig,
 } from "@shotlin/database";
@@ -99,13 +102,23 @@ export async function loadJobData(db: Db, jobId: string) {
     .from(jobInputs)
     .where(eq(jobInputs.jobId, jobId));
 
-  const allAssets = await db.select().from(assets);
-  const assetsById = new Map(allAssets.map((a) => [a.id, a]));
-
   const allModels = await db.select().from(modelRegistry);
   const modelsByRole = new Map(
     allModels.filter((m) => m.isEnabled).map((m) => [m.role, m]),
   );
+  // A customer's explicit image-model choice overrides whatever the
+  // production workflow node is bound to. Fetched by ID directly (not
+  // gated on isEnabled here) — the choice was already validated as
+  // enabled at job-creation time, and an admin disabling a model later
+  // shouldn't retroactively break jobs a customer already committed to.
+  if (job.imageModelId) {
+    const [chosen] = await db
+      .select()
+      .from(modelRegistry)
+      .where(eq(modelRegistry.id, job.imageModelId))
+      .limit(1);
+    if (chosen) modelsByRole.set("image_generator", chosen);
+  }
 
   const priceRows = await db
     .select()
@@ -152,7 +165,6 @@ export async function loadJobData(db: Db, jobId: string) {
     character: character ?? null,
     environment: environment ?? null,
     inputs,
-    assetsById,
     modelsByRole,
     priceVersionsByModelId,
     promptVersionsById,
@@ -204,6 +216,36 @@ export async function getPreviousAttempts(db: Db, jobId: string): Promise<JobAtt
     .from(jobAttempts)
     .where(eq(jobAttempts.jobId, jobId))
     .orderBy(jobAttempts.attemptNumber);
+}
+
+/**
+ * Mark any attempt for this job still stuck at status "running" past the
+ * distributed lock's TTL as failed. Every normal exception path already
+ * transitions its attempt to "failed" via a try/finally in
+ * `processGenerationJob` — this only ever fires after a hard process crash
+ * (OOM kill, container restart, power loss), where that finally block never
+ * got to run and the attempt row is orphaned. Without this, `getPreviousAttempts`
+ * would keep counting a dead attempt as "running" forever, and the job would
+ * never surface as failed/retryable to an operator.
+ */
+export async function markStaleRunningAttemptsFailed(
+  db: Db,
+  jobId: string,
+  olderThanMs: number,
+): Promise<number> {
+  const cutoff = new Date(Date.now() - olderThanMs);
+  const stale = await db
+    .update(jobAttempts)
+    .set({ status: "failed", finishedAt: new Date() })
+    .where(
+      and(
+        eq(jobAttempts.jobId, jobId),
+        eq(jobAttempts.status, "running"),
+        sql`${jobAttempts.startedAt} < ${cutoff.toISOString()}`,
+      ),
+    )
+    .returning({ id: jobAttempts.id });
+  return stale.length;
 }
 
 // ─── Steps ────────────────────────────────────────────────────────────────────
@@ -457,4 +499,114 @@ export async function finalizeJobCost(
       updatedAt: new Date(),
     })
     .where(eq(jobs.id, jobId));
+}
+
+/**
+ * The true cumulative spend for a job, summed directly from the cost_events
+ * ledger rather than read from `jobs.total_cost_inr`. This is the source of
+ * truth: `jobs.total_cost_inr` is only ever a materialized cache of this sum
+ * and must never be trusted on its own for budget enforcement — a job that
+ * has gone through a retry (or any exit path that doesn't call
+ * `finalizeJobCost`) can have a stale cached total that understates real
+ * spend by the full cost of every earlier attempt.
+ */
+export async function sumCostEventsForJob(
+  db: Db,
+  jobId: string,
+): Promise<{ usd: number; inr: number }> {
+  const [row] = await db
+    .select({
+      usd: sql<string>`coalesce(sum(${costEvents.usdCost}), 0)`,
+      inr: sql<string>`coalesce(sum(${costEvents.inrCost}), 0)`,
+    })
+    .from(costEvents)
+    .where(eq(costEvents.jobId, jobId));
+  return { usd: Number(row?.usd ?? 0), inr: Number(row?.inr ?? 0) };
+}
+
+/**
+ * Persist a repair plan before acting on it — retry intelligence (which
+ * defects, what to preserve, what to fix) survives attempt/process
+ * boundaries instead of living only in worker memory.
+ */
+export async function createRetryPlan(
+  db: Db,
+  input: {
+    jobId: string;
+    sourceAttemptId: string;
+    sourceCandidateId: string;
+    scope: "full_set" | "single_angle";
+    failedAngle: string | null;
+    criticalDefectCodes: string[];
+    minorDefectCodes: string[];
+    reviewerExplanation: string | null;
+    repairInstruction: string;
+    protectedAttributes: string[];
+    generationModelId: string | null;
+  },
+): Promise<RetryPlan> {
+  const [plan] = await db.insert(retryPlans).values(input).returning();
+  return plan;
+}
+
+/** Mark a retry plan resolved once the repair attempt has been reviewed. */
+export async function resolveRetryPlan(
+  db: Db,
+  retryPlanId: string,
+  input: { resultCandidateId: string | null; resultDecision: string | null; status: string },
+): Promise<void> {
+  await db
+    .update(retryPlans)
+    .set({
+      resultCandidateId: input.resultCandidateId,
+      resultDecision: input.resultDecision,
+      status: input.status,
+      resolvedAt: new Date(),
+    })
+    .where(eq(retryPlans.id, retryPlanId));
+}
+
+/** How many times a specific candidate's angle has already had a single-angle retry attempted for this job. */
+export async function countPriorAngleRetries(
+  db: Db,
+  jobId: string,
+  cameraAngle: string | null,
+): Promise<number> {
+  const [row] = await db
+    .select({ count: sql<string>`count(*)` })
+    .from(retryPlans)
+    .where(
+      and(
+        eq(retryPlans.jobId, jobId),
+        eq(retryPlans.scope, "single_angle"),
+        cameraAngle === null ? sql`${retryPlans.failedAngle} is null` : eq(retryPlans.failedAngle, cameraAngle),
+      ),
+    );
+  return Number(row?.count ?? 0);
+}
+
+/**
+ * Another enabled image_generator model to try when the configured one
+ * declines to generate (e.g. Gemini's opaque IMAGE_OTHER refusal) rather
+ * than failing the whole job outright. Deterministic (oldest-other-enabled
+ * wins), not random — a job retried twice should pick the same fallback
+ * both times.
+ */
+export async function getFallbackImageModel(
+  db: Db,
+  excludeModelId: string,
+): Promise<ModelRegistry | null> {
+  const [row] = await db
+    .select()
+    .from(modelRegistry)
+    .where(
+      and(
+        eq(modelRegistry.role, "image_generator"),
+        eq(modelRegistry.isEnabled, true),
+        ne(modelRegistry.id, excludeModelId),
+      ),
+    )
+    .orderBy(modelRegistry.createdAt)
+    .limit(1);
+  return row ?? null;
 }

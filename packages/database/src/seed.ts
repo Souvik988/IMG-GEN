@@ -93,7 +93,31 @@ async function main() {
   const { db, pool } = createDb(url, 1);
 
   /* ---------------- budget rules (singleton) ---------------- */
-  await db.insert(budgetRules).values({ singletonKey: "global" }).onConflictDoNothing();
+  await db
+    .insert(budgetRules)
+    .values({
+      singletonKey: "global",
+      // Defect codes that always FAIL a candidate even if the reviewer
+      // itself classified them as minor — see docs/03_Shotlin_MVP_AI_Build_Instructions.md
+      // "Hard-fail rules". Admin-editable after seeding.
+      hardFailDefectCodes: [
+        "WRONG_PRIMARY_COLOR",
+        "MISSING_BORDER",
+        "WRONG_BORDER_PATTERN",
+        "WRONG_PALLU",
+        "MAJOR_EMBROIDERY_CHANGE",
+        "LOGO_CHANGED",
+        "GARMENT_COMPONENT_MISSING",
+        "MAJOR_SILHOUETTE_CHANGE",
+        "WRONG_CHARACTER",
+        "BROKEN_HAND",
+        "BROKEN_LIMB",
+        "EXTRA_LIMB",
+        "SEVERE_FACE_ARTIFACT",
+        "SEVERE_AI_ARTIFACT",
+      ],
+    })
+    .onConflictDoNothing();
 
   /* ---------------- users ---------------- */
   const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? "shotlin-admin-123";

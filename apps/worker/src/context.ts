@@ -63,6 +63,9 @@ export interface WorkflowContext {
     candidate: GenerationCandidate;
     qualityReview: QualityReview | null;
     secondReview: QualityReview | null;
+    /** This candidate's own PASS/FAIL/UNCERTAIN outcome. Null = not yet reviewed. */
+    decision: RuleResultDecision | null;
+    decisionReasons: string[];
   }>;
   finalCandidate: GenerationCandidate | null;
 

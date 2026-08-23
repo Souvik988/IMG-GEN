@@ -1,0 +1,2 @@
+CREATE TYPE "public"."detail_kind" AS ENUM('border', 'embroidery', 'pattern', 'neckline', 'sleeve', 'pallu', 'other');--> statement-breakpoint
+ALTER TABLE "job_inputs" ADD COLUMN "detail_kind" "detail_kind";

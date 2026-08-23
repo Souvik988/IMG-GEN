@@ -4,9 +4,9 @@
 
 import { eq } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
-import { jobAttempts } from "@shotlin/database";
+import { jobAttempts, jobs } from "@shotlin/database";
 import type { Db } from "@shotlin/database";
-import { createGenerationQueue, createRedisConnection } from "@shotlin/platform";
+import { createGenerationQueue, createRedisConnection, createLogger } from "@shotlin/platform";
 import {
   evaluateRules,
   DEFAULT_RULE_CONFIG,
@@ -17,12 +17,16 @@ import {
   loadJobData,
   createAttempt,
   finalizeJobCost,
+  sumCostEventsForJob,
   updateJobState,
   updateAttempt,
   getPreviousAttempts,
+  markStaleRunningAttemptsFailed,
 } from "./db";
 import { NODE_RUNNERS, runSkippedNode } from "./nodes";
 import type { WorkflowContext } from "./context";
+
+const log = createLogger("worker.processor");
 
 export type ProcessorDeps = {
   db: Db;
@@ -50,19 +54,18 @@ export async function processGenerationJob(
     "cancelled",
   ] as const;
   if (terminalStates.includes(data.job.state as (typeof terminalStates)[number])) {
-    console.log(
-      `[worker] job ${jobId} already terminal (${data.job.state}), skipping`,
-    );
+    log.info("job already terminal, skipping", { jobId, state: data.job.state });
     return;
   }
 
   // BullMQ is at-least-once. A short distributed lock prevents duplicate queue
   // deliveries or two workers from creating two billable attempts for one job.
+  const LOCK_TTL_MS = 15 * 60 * 1000;
   const lockKey = `shotlin:generation-lock:${jobId}`;
   const lockToken = randomUUID();
-  const acquired = await deps.lockRedis.set(lockKey, lockToken, "PX", 15 * 60 * 1000, "NX");
+  const acquired = await deps.lockRedis.set(lockKey, lockToken, "PX", LOCK_TTL_MS, "NX");
   if (acquired !== "OK") {
-    console.log(`[worker] job ${jobId} already has an active worker lock, skipping duplicate delivery`);
+    log.info("job already locked, skipping duplicate delivery", { jobId });
     return;
   }
   const releaseLock = async () => {
@@ -74,13 +77,27 @@ export async function processGenerationJob(
     );
   };
 
+  // Every normal exception is already handled by the try/finally below
+  // (persists cost, sets a terminal/manual_review state, releases the lock).
+  // This only ever fires after a hard process crash — the lock we just
+  // acquired proves no one currently holds it, so any attempt still stuck at
+  // "running" is provably orphaned, not concurrently in progress.
+  const staleCount = await markStaleRunningAttemptsFailed(db, jobId, LOCK_TTL_MS);
+  if (staleCount > 0) {
+    log.warn("marked orphaned running attempt(s) as failed (likely a prior worker crash)", { jobId, staleCount });
+  }
+
   // ── Load or create attempt ───────────────────────────────────────────────────
   const previousAttempts = await getPreviousAttempts(db, jobId);
   const attemptNumber = previousAttempts.length + 1;
   const maxAttempts = Number(data.budgetRules.maxAttempts ?? 3);
 
-  // Budget check before starting a new attempt
-  const currentSpendInr = Number(data.job.totalCostInr ?? 0);
+  // Budget check before starting a new attempt. This is read from the
+  // cost_events ledger directly, not from the cached jobs.total_cost_inr
+  // column — that column is only updated at certain exit points, so after a
+  // retry it can understate real spend by the full cost of every earlier
+  // attempt, letting a job blow past its budget across enough retries.
+  const currentSpendInr = (await sumCostEventsForJob(db, jobId)).inr;
   // The configured hard stop is priced per delivered image, so a multi-angle
   // set scales its ceiling instead of aborting partway through the fan-out.
   const imagesRequested = Math.max(Number(data.job.outputCount ?? 1), 1);
@@ -121,9 +138,13 @@ export async function processGenerationJob(
   );
 
   if (currentSpendInr + nextAttemptCost.inrCost > hardStop) {
-    console.log(
-      `[worker] job ${jobId}: budget stop (spent ₹${currentSpendInr.toFixed(2)}, hard stop ₹${hardStop}, next attempt ~₹${nextAttemptCost.inrCost.toFixed(2)})`,
-    );
+    log.info("budget stop before attempt could start", {
+      jobId,
+      attemptNumber,
+      spentInr: Number(currentSpendInr.toFixed(2)),
+      hardStopInr: hardStop,
+      nextAttemptInr: Number(nextAttemptCost.inrCost.toFixed(2)),
+    });
     await updateJobState(
       db,
       jobId,
@@ -168,9 +189,7 @@ export async function processGenerationJob(
     skillRules: data.skillRules,
   };
 
-  console.log(
-    `[worker] job ${jobId} | attempt ${attemptNumber} | starting`,
-  );
+  log.info("attempt starting", { jobId, attemptId: attempt.id, attemptNumber });
 
   try {
     await runConfiguredWorkflow({
@@ -423,15 +442,24 @@ export async function processGenerationJob(
     */
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[worker] job ${jobId} | ✗ ERROR: ${message}`);
+    log.error("attempt errored", { jobId, attemptId: attempt.id, attemptNumber, error: message });
     // Persist spend even when a provider returned billable usage but the
     // workflow could not safely continue. This keeps the cost ledger honest.
     await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
-    // Image generation is completed and persisted before quality review. If a
-    // later infrastructure or reviewer error occurs, preserve that paid asset
-    // for the customer under manual review instead of presenting it as lost.
-    const terminalState = ctx.candidates.length > 0 ? "manual_review" : "failed";
-    await updateJobState(db, jobId, terminalState, message);
+    // A node runner may have already set a more specific terminal state
+    // before throwing — runInputCheck sets "input_rejected", which the
+    // customer UI labels distinctly ("Reference rejected") from a generic
+    // failure ("Generation stopped"). Don't clobber that with the generic
+    // fallback below; it was already the more informative, more actionable
+    // state for the customer.
+    const [current] = await db.select({ state: jobs.state }).from(jobs).where(eq(jobs.id, jobId)).limit(1);
+    if (current?.state !== "input_rejected") {
+      // Image generation is completed and persisted before quality review. If a
+      // later infrastructure or reviewer error occurs, preserve that paid asset
+      // for the customer under manual review instead of presenting it as lost.
+      const terminalState = ctx.candidates.length > 0 ? "manual_review" : "failed";
+      await updateJobState(db, jobId, terminalState, message);
+    }
     await db
       .update(jobAttempts)
       .set({ status: "failed", finishedAt: new Date() })
@@ -474,7 +502,7 @@ async function runConfiguredWorkflow({
     minTechnicalQuality: Number(data.budgetRules.minTechnicalQuality ?? DEFAULT_RULE_CONFIG.minTechnicalQuality),
     uncertaintyBand: Number(data.budgetRules.uncertaintyBand ?? DEFAULT_RULE_CONFIG.uncertaintyBand),
     minReviewerConfidence: Number(data.budgetRules.minReviewerConfidence ?? DEFAULT_RULE_CONFIG.minReviewerConfidence),
-    hardFailDefectCodes: [] as string[],
+    hardFailDefectCodes: (data.budgetRules.hardFailDefectCodes ?? []) as string[],
   };
   let finalDecision: ReturnType<typeof evaluateRules>["decision"] | null = null;
   let decisionReasons: string[] = [];
@@ -580,19 +608,25 @@ async function runConfiguredWorkflow({
           });
           const totalSpend = currentSpendInr + ctx.totalCostInr;
           if (totalSpend >= hardStop) {
+            // Persist the true cumulative spend at every exit, not just on
+            // success — otherwise the cached jobs.total_cost_inr silently
+            // forgets every attempt that didn't end in finalize().
+            await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
             await updateJobState(db, jobId, "budget_stopped", "Budget exhausted after attempt");
             return;
           }
           if (attemptNumber >= maxAttempts) {
+            await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
             await updateJobState(db, jobId, "failed", `Max attempts (${maxAttempts}) reached`);
             return;
           }
+          await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
           await updateJobState(db, jobId, "retrying");
           await db.update(jobAttempts).set({ status: "failed", finishedAt: new Date() }).where(eq(jobAttempts.id, attempt.id));
           await runner(ctx, node as any, deps);
           const queue = createGenerationQueue(process.env.REDIS_URL ?? "redis://localhost:6381");
           await queue.add("generate", { jobId }, { jobId: `retry-${jobId}-${attemptNumber + 1}` });
-          console.log(`[worker] job ${jobId} | retry ${attemptNumber + 1} enqueued`);
+          log.info("retry enqueued", { jobId, attemptId: attempt.id, nextAttemptNumber: attemptNumber + 1 });
           return;
         }
       case "finalize":
@@ -601,7 +635,12 @@ async function runConfiguredWorkflow({
           await updateJobState(db, jobId, "finalizing");
           await runner(ctx, node as any, deps);
           await updateJobState(db, jobId, "ready", "Generation complete");
-          console.log(`[worker] job ${jobId} | ✓ READY | attempt ${attemptNumber} | cost ₹${ctx.totalCostInr.toFixed(2)}`);
+          log.info("job ready", {
+            jobId,
+            attemptId: attempt.id,
+            attemptNumber,
+            costInr: Number(ctx.totalCostInr.toFixed(2)),
+          });
           return;
         }
         break;
@@ -609,14 +648,21 @@ async function runConfiguredWorkflow({
   }
 
   if (finalDecision === "PASS") {
+    await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
     await updateAttempt(db, attempt.id, { status: "passed" });
     await updateJobState(db, jobId, "ready", "Generation complete");
     return;
   }
   if (finalDecision === "FAIL") {
+    await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
     await updateJobState(db, jobId, "failed", "Workflow ended without an enabled retry node");
     return;
   }
+  await finalizeJobCost(db, jobId, ctx.totalCostUsd, ctx.totalCostInr);
   await updateJobState(db, jobId, "manual_review");
-  console.log(`[worker] job ${jobId} | → MANUAL_REVIEW (uncertain after second review)`);
+  log.info("job routed to manual review (uncertain after second review)", {
+    jobId,
+    attemptId: attempt.id,
+    attemptNumber,
+  });
 }

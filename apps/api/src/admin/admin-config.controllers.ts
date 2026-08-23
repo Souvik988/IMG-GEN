@@ -2,12 +2,14 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Inject,
   NotFoundException,
   Param,
   Post,
   Put,
+  Query,
   Req,
   UseGuards,
 } from "@nestjs/common";
@@ -37,6 +39,37 @@ import { AdminService } from "./admin.service";
 /* Workflow                                                            */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Fixed pipeline dependency graph — every node key that appears must run
+ * after the node keys it depends on. Shared by order-save (mutating) and
+ * validate/publish (read-only) so they can never silently disagree.
+ */
+const WORKFLOW_NODE_DEPENDENCIES: Record<string, string[]> = {
+  vision: ["input_check"],
+  skill_select: ["vision"],
+  prompt_compile: ["skill_select"],
+  image_generate: ["prompt_compile"],
+  quality_review: ["image_generate"],
+  rule_engine: ["quality_review"],
+  second_review: ["rule_engine"],
+  retry: ["rule_engine", "second_review"],
+  finalize: ["rule_engine", "second_review"],
+};
+
+function validateNodeOrder(nodeKeys: string[]): string[] {
+  const errors: string[] = [];
+  const position = new Map(nodeKeys.map((nodeKey, index) => [nodeKey, index]));
+  for (const [nodeKey, requiredBefore] of Object.entries(WORKFLOW_NODE_DEPENDENCIES)) {
+    if (!position.has(nodeKey)) continue;
+    for (const dependency of requiredBefore) {
+      if (position.has(dependency) && position.get(dependency)! > position.get(nodeKey)!) {
+        errors.push(`${nodeKey} must run after ${dependency}`);
+      }
+    }
+  }
+  return errors;
+}
+
 @Controller("/admin/workflow")
 @UseGuards(AdminGuard)
 class WorkflowController {
@@ -45,86 +78,148 @@ class WorkflowController {
     private admin: AdminService,
   ) {}
 
-  @Get()
-  async get() {
+  private async getWorkflow() {
     const wf = (
       await this.db.select().from(workflows).where(eq(workflows.key, "default")).limit(1)
     )[0];
+    if (!wf) throw new NotFoundException("Workflow not found");
+    return wf;
+  }
+
+  private async getVersion(versionId: string) {
+    const version = (
+      await this.db.select().from(workflowVersions).where(eq(workflowVersions.id, versionId)).limit(1)
+    )[0];
+    if (!version) throw new NotFoundException("Workflow version not found");
+    return version;
+  }
+
+  private async getVersionNodes(versionId: string) {
+    return this.db
+      .select({ node: workflowNodes, config: workflowNodeConfigs })
+      .from(workflowNodes)
+      .leftJoin(workflowNodeConfigs, eq(workflowNodeConfigs.nodeId, workflowNodes.id))
+      .where(eq(workflowNodes.workflowVersionId, versionId))
+      .orderBy(asc(workflowNodes.sequence));
+  }
+
+  /** Production is read-only outside the draft → publish flow; only a draft can be mutated directly. */
+  private assertDraft(version: { status: string }) {
+    if (version.status !== "draft") {
+      throw new BadRequestException("Only a draft version can be edited — clone a draft first");
+    }
+  }
+
+  @Get()
+  async get() {
+    const wf = await this.getWorkflow();
     const versions = await this.db
       .select()
       .from(workflowVersions)
       .where(eq(workflowVersions.workflowId, wf.id))
       .orderBy(desc(workflowVersions.version));
     const production = versions.find((v) => v.status === "production") ?? versions[0];
-
-    const nodes = await this.db
-      .select({
-        node: workflowNodes,
-        config: workflowNodeConfigs,
-      })
-      .from(workflowNodes)
-      .leftJoin(workflowNodeConfigs, eq(workflowNodeConfigs.nodeId, workflowNodes.id))
-      .where(eq(workflowNodes.workflowVersionId, production.id))
-      .orderBy(asc(workflowNodes.sequence));
-
+    if (!production) throw new NotFoundException("Production workflow version not found");
+    const nodes = await this.getVersionNodes(production.id);
     return { workflow: wf, versions, activeVersion: production, nodes };
   }
 
-  @Put("/order")
-  async reorder(@Req() req: AuthedRequest, @Body() body: unknown) {
-    const input = parseWith(
-      z.object({ nodeKeys: z.array(z.string().min(1)).min(1) }),
-      body,
-    );
-    const workflow = (
-      await this.db.select().from(workflows).where(eq(workflows.key, "default")).limit(1)
-    )[0];
-    if (!workflow) throw new NotFoundException("Workflow not found");
+  @Get("/versions/:versionId")
+  async getVersionDetail(@Param("versionId") versionId: string) {
+    const version = await this.getVersion(versionId);
+    const nodes = await this.getVersionNodes(versionId);
+    return { version, nodes };
+  }
+
+  /**
+   * Clone the current production version's nodes + configs into a new
+   * draft version. The draft is fully independent — editing it can never
+   * affect a running job, which always references the version it was
+   * created against.
+   */
+  @Post("/draft")
+  async createDraft(@Req() req: AuthedRequest) {
+    const wf = await this.getWorkflow();
     const versions = await this.db
       .select()
       .from(workflowVersions)
-      .where(eq(workflowVersions.workflowId, workflow.id))
+      .where(eq(workflowVersions.workflowId, wf.id))
       .orderBy(desc(workflowVersions.version));
-    const production = versions.find((version) => version.status === "production") ?? versions[0];
+    const production = versions.find((v) => v.status === "production") ?? versions[0];
     if (!production) throw new NotFoundException("Production workflow version not found");
+    const existingDraft = versions.find((v) => v.status === "draft");
+    if (existingDraft) {
+      return { version: existingDraft, nodes: await this.getVersionNodes(existingDraft.id) };
+    }
 
-    const productionNodes = await this.db
+    const sourceNodes = await this.getVersionNodes(production.id);
+    const nextVersionNumber = Math.max(...versions.map((v) => v.version)) + 1;
+
+    const result = await this.db.transaction(async (tx) => {
+      const [draft] = await tx
+        .insert(workflowVersions)
+        .values({ workflowId: wf.id, version: nextVersionNumber, status: "draft" })
+        .returning();
+      for (const { node, config } of sourceNodes) {
+        const [newNode] = await tx
+          .insert(workflowNodes)
+          .values({
+            workflowVersionId: draft.id,
+            nodeKey: node.nodeKey,
+            sequence: node.sequence,
+            name: node.name,
+            nodeType: node.nodeType,
+            isEnabled: node.isEnabled,
+          })
+          .returning();
+        if (config) {
+          await tx.insert(workflowNodeConfigs).values({
+            nodeId: newNode.id,
+            modelId: config.modelId,
+            promptVersionId: config.promptVersionId,
+            timeoutMs: config.timeoutMs,
+            maxRetries: config.maxRetries,
+            thresholds: config.thresholds,
+            settings: config.settings,
+          });
+        }
+      }
+      return draft;
+    });
+
+    await this.admin.audit(req.user!.id, "workflow_draft.create", "workflow_version", result.id, {
+      clonedFrom: production.id,
+      version: nextVersionNumber,
+    });
+    return { version: result, nodes: await this.getVersionNodes(result.id) };
+  }
+
+  @Put("/versions/:versionId/order")
+  async reorder(@Req() req: AuthedRequest, @Param("versionId") versionId: string, @Body() body: unknown) {
+    const input = parseWith(z.object({ nodeKeys: z.array(z.string().min(1)).min(1) }), body);
+    const version = await this.getVersion(versionId);
+    this.assertDraft(version);
+
+    const versionNodes = await this.db
       .select()
       .from(workflowNodes)
-      .where(eq(workflowNodes.workflowVersionId, production.id));
-    const expected = new Set(productionNodes.map((node) => node.nodeKey));
+      .where(eq(workflowNodes.workflowVersionId, versionId));
+    const expected = new Set(versionNodes.map((node) => node.nodeKey));
     const requested = new Set(input.nodeKeys);
     if (
       requested.size !== expected.size ||
       requested.size !== input.nodeKeys.length ||
       input.nodeKeys.some((nodeKey) => !expected.has(nodeKey))
     ) {
-      throw new BadRequestException("Order must include every production node exactly once");
+      throw new BadRequestException("Order must include every node in this version exactly once");
     }
 
-    const position = new Map(input.nodeKeys.map((nodeKey, index) => [nodeKey, index]));
-    const dependencies: Record<string, string[]> = {
-      vision: ["input_check"],
-      skill_select: ["vision"],
-      prompt_compile: ["skill_select"],
-      image_generate: ["prompt_compile"],
-      quality_review: ["image_generate"],
-      rule_engine: ["quality_review"],
-      second_review: ["rule_engine"],
-      retry: ["rule_engine", "second_review"],
-      finalize: ["rule_engine", "second_review"],
-    };
-    for (const [nodeKey, requiredBefore] of Object.entries(dependencies)) {
-      for (const dependency of requiredBefore) {
-        if ((position.get(dependency) ?? -1) > (position.get(nodeKey) ?? -1)) {
-          throw new BadRequestException(`${nodeKey} must run after ${dependency}`);
-        }
-      }
-    }
+    const errors = validateNodeOrder(input.nodeKeys);
+    if (errors.length > 0) throw new BadRequestException(errors.join("; "));
 
     await this.db.transaction(async (tx) => {
       for (const [index, nodeKey] of input.nodeKeys.entries()) {
-        const node = productionNodes.find((candidate) => candidate.nodeKey === nodeKey);
+        const node = versionNodes.find((candidate) => candidate.nodeKey === nodeKey);
         if (node) {
           await tx
             .update(workflowNodes)
@@ -133,12 +228,17 @@ class WorkflowController {
         }
       }
     });
-    await this.admin.audit(req.user!.id, "workflow_order.update", "workflow_version", production.id, input);
+    await this.admin.audit(req.user!.id, "workflow_order.update", "workflow_version", versionId, input);
     return { ok: true, nodeKeys: input.nodeKeys };
   }
 
-  @Put("/:nodeKey")
-  async updateNode(@Req() req: AuthedRequest, @Param("nodeKey") nodeKey: string, @Body() body: unknown) {
+  @Put("/versions/:versionId/:nodeKey")
+  async updateNode(
+    @Req() req: AuthedRequest,
+    @Param("versionId") versionId: string,
+    @Param("nodeKey") nodeKey: string,
+    @Body() body: unknown,
+  ) {
     const schema = z.object({
       isEnabled: z.boolean().optional(),
       modelId: z.string().uuid().nullable().optional(),
@@ -149,11 +249,17 @@ class WorkflowController {
       settings: z.record(z.unknown()).optional(),
     });
     const input = parseWith(schema, body);
+    const version = await this.getVersion(versionId);
+    this.assertDraft(version);
 
     const nodeRow = (
-      await this.db.select().from(workflowNodes).where(eq(workflowNodes.nodeKey, nodeKey)).limit(1)
+      await this.db
+        .select()
+        .from(workflowNodes)
+        .where(and(eq(workflowNodes.workflowVersionId, versionId), eq(workflowNodes.nodeKey, nodeKey)))
+        .limit(1)
     )[0];
-    if (!nodeRow) throw new NotFoundException("Node not found");
+    if (!nodeRow) throw new NotFoundException("Node not found in this version");
 
     if (input.isEnabled !== undefined) {
       await this.db
@@ -193,6 +299,124 @@ class WorkflowController {
     await this.admin.audit(req.user!.id, "workflow_node.update", "workflow_node", nodeRow.id, input);
     return { ok: true };
   }
+
+  /** Discard a draft that was never published. Production and archived versions are permanent history and cannot be deleted. */
+  @Delete("/versions/:versionId")
+  async discardDraft(@Req() req: AuthedRequest, @Param("versionId") versionId: string) {
+    const version = await this.getVersion(versionId);
+    if (version.status !== "draft") {
+      throw new BadRequestException("Only a draft version can be discarded");
+    }
+    await this.db.delete(workflowVersions).where(eq(workflowVersions.id, versionId));
+    await this.admin.audit(req.user!.id, "workflow_draft.discard", "workflow_version", versionId, {});
+    return { ok: true };
+  }
+
+  /** Structural validation only — never mutates. Also run automatically before publish. */
+  @Post("/versions/:versionId/validate")
+  async validate(@Param("versionId") versionId: string) {
+    const version = await this.getVersion(versionId);
+    const nodes = await this.getVersionNodes(versionId);
+    const errors: string[] = [];
+
+    const requiredNodeKeys = ["input_check", "image_generate", "rule_engine", "finalize"];
+    const presentKeys = new Set(nodes.map((n) => n.node.nodeKey));
+    for (const required of requiredNodeKeys) {
+      if (!presentKeys.has(required)) errors.push(`Missing required node: ${required}`);
+    }
+
+    const enabledOrdered = nodes
+      .filter((n) => n.node.isEnabled)
+      .sort((a, b) => a.node.sequence - b.node.sequence)
+      .map((n) => n.node.nodeKey);
+    errors.push(...validateNodeOrder(enabledOrdered));
+
+    const billedRoles = new Set(["image_generate", "quality_review", "second_review", "vision", "skill_select", "prompt_compile"]);
+    for (const { node, config } of nodes) {
+      if (node.isEnabled && billedRoles.has(node.nodeKey) && node.nodeType !== "deterministic" && !config?.modelId) {
+        // Deterministic-capable nodes (skill_select, prompt_compile) may legitimately run without a model; only flag the AI-only stages.
+        if (["image_generate", "quality_review", "second_review", "vision"].includes(node.nodeKey)) {
+          errors.push(`${node.name} is enabled but has no model bound`);
+        }
+      }
+    }
+
+    return { valid: errors.length === 0, errors, versionStatus: version.status };
+  }
+
+  /** Draft → production. Archives whatever was production before. */
+  @Post("/versions/:versionId/publish")
+  async publish(@Req() req: AuthedRequest, @Param("versionId") versionId: string) {
+    const version = await this.getVersion(versionId);
+    if (version.status !== "draft") {
+      throw new BadRequestException("Only a draft version can be published");
+    }
+    const check = await this.validate(versionId);
+    if (!check.valid) {
+      throw new BadRequestException(`Cannot publish an invalid workflow: ${check.errors.join("; ")}`);
+    }
+
+    const previousProduction = (
+      await this.db
+        .select()
+        .from(workflowVersions)
+        .where(and(eq(workflowVersions.workflowId, version.workflowId), eq(workflowVersions.status, "production")))
+        .limit(1)
+    )[0];
+
+    await this.db.transaction(async (tx) => {
+      if (previousProduction) {
+        await tx
+          .update(workflowVersions)
+          .set({ status: "archived" })
+          .where(eq(workflowVersions.id, previousProduction.id));
+      }
+      await tx
+        .update(workflowVersions)
+        .set({ status: "production", publishedAt: new Date() })
+        .where(eq(workflowVersions.id, versionId));
+    });
+
+    await this.admin.audit(req.user!.id, "workflow.publish", "workflow_version", versionId, {
+      replacedVersion: previousProduction?.id ?? null,
+    });
+    return { ok: true };
+  }
+
+  /** A previously-archived (or otherwise non-production) version → production. */
+  @Post("/versions/:versionId/rollback")
+  async rollback(@Req() req: AuthedRequest, @Param("versionId") versionId: string) {
+    const version = await this.getVersion(versionId);
+    if (version.status !== "archived") {
+      throw new BadRequestException("Only an archived version can be rolled back to");
+    }
+
+    const previousProduction = (
+      await this.db
+        .select()
+        .from(workflowVersions)
+        .where(and(eq(workflowVersions.workflowId, version.workflowId), eq(workflowVersions.status, "production")))
+        .limit(1)
+    )[0];
+
+    await this.db.transaction(async (tx) => {
+      if (previousProduction) {
+        await tx
+          .update(workflowVersions)
+          .set({ status: "archived" })
+          .where(eq(workflowVersions.id, previousProduction.id));
+      }
+      await tx
+        .update(workflowVersions)
+        .set({ status: "production", publishedAt: new Date() })
+        .where(eq(workflowVersions.id, versionId));
+    });
+
+    await this.admin.audit(req.user!.id, "workflow.rollback", "workflow_version", versionId, {
+      replacedVersion: previousProduction?.id ?? null,
+    });
+    return { ok: true };
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -212,6 +436,124 @@ class ModelsController {
     @Inject(DB) private db: ApiDb,
     private admin: AdminService,
   ) {}
+
+  /**
+   * Browse OpenRouter's real, live image-generation catalog — separate
+   * from the admin-curated `model_registry` this app actually runs on.
+   * Filtered to models that support at least one reference image, since
+   * every generation in this app is reference-driven (garment/character
+   * photos); a model that can't accept a reference image is fundamentally
+   * unusable here, not just untested.
+   */
+  @Get("/discover")
+  async discover() {
+    const config = getAppConfig();
+    if (!config.OPENROUTER_API_KEY) {
+      throw new BadRequestException("OPENROUTER_API_KEY is not configured on the server");
+    }
+    const res = await fetch("https://openrouter.ai/api/v1/images/models", {
+      headers: { Authorization: `Bearer ${config.OPENROUTER_API_KEY}` },
+    });
+    if (!res.ok) {
+      throw new BadRequestException(`OpenRouter catalog request failed: HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as {
+      data: Array<{
+        id: string;
+        name: string;
+        description?: string;
+        supported_parameters?: { input_references?: { max?: number } };
+      }>;
+    };
+    const models = (payload.data ?? [])
+      .filter((m) => (m.supported_parameters?.input_references?.max ?? 0) > 0)
+      .map((m) => ({ id: m.id, name: m.name, description: m.description ?? null }));
+    return { models };
+  }
+
+  /**
+   * Structured capabilities + live pricing for one OpenRouter image model —
+   * the exact shape `model_registry.capabilities` expects
+   * (`packages/core/src/model-capabilities.ts`), sourced from OpenRouter's
+   * own spec instead of hand-guessed. `modelId` travels as a query param,
+   * not a path segment, since OpenRouter model IDs contain a `/`.
+   *
+   * A model can have *multiple* provider endpoints (e.g. Nano Banana Pro
+   * serves via both "Google Vertex" and "Google AI Studio", and only the
+   * AI Studio one supports 4K) — the first version of this endpoint took
+   * only `endpoints[0]`, silently dropping any capability an earlier-listed
+   * provider didn't have. OpenRouter routes each request to whichever
+   * provider can actually serve the parameters requested, so the model's
+   * real capability is the *union* across all its endpoints, not just the
+   * first one.
+   */
+  @Get("/discover-detail")
+  async discoverDetail(@Query("modelId") modelId: string) {
+    if (!modelId) throw new BadRequestException("modelId is required");
+    const config = getAppConfig();
+    if (!config.OPENROUTER_API_KEY) {
+      throw new BadRequestException("OPENROUTER_API_KEY is not configured on the server");
+    }
+    const res = await fetch(`https://openrouter.ai/api/v1/images/models/${modelId}/endpoints`, {
+      headers: { Authorization: `Bearer ${config.OPENROUTER_API_KEY}` },
+    });
+    if (!res.ok) {
+      throw new BadRequestException(`OpenRouter model lookup failed: HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as {
+      endpoints?: Array<{
+        provider_name?: string;
+        supported_parameters?: {
+          resolution?: { values?: string[] };
+          n?: { max?: number };
+          input_references?: { max?: number };
+        };
+        pricing?: Array<{ billable: string; unit: string; cost_usd: number }>;
+      }>;
+    };
+    const endpoints = payload.endpoints ?? [];
+    if (endpoints.length === 0) throw new NotFoundException("No provider endpoint found for this model");
+
+    const resolutionSet = new Set<string>();
+    let maxImageRefs = 0;
+    let maxCount = 1;
+    for (const endpoint of endpoints) {
+      for (const r of endpoint.supported_parameters?.resolution?.values ?? []) resolutionSet.add(r.toLowerCase());
+      maxImageRefs = Math.max(maxImageRefs, endpoint.supported_parameters?.input_references?.max ?? 0);
+      maxCount = Math.max(maxCount, endpoint.supported_parameters?.n?.max ?? 1);
+    }
+    const resolutions = [...resolutionSet];
+
+    // Only "output_image" priced by the "image" unit is a flat per-image
+    // cost `imagePrices` can hold directly — some models (Nano Banana Pro
+    // included) bill per output *token* instead, where the real per-image
+    // cost depends on how many tokens the image actually renders to.
+    // Treating a per-token rate as a flat per-image price would silently
+    // and badly under-record real spend, so it's surfaced separately
+    // instead of guessed at.
+    const perImageEntry = endpoints
+      .flatMap((e) => e.pricing ?? [])
+      .find((p) => p.billable === "output_image" && p.unit === "image");
+    const perTokenEntry = endpoints
+      .flatMap((e) => e.pricing ?? [])
+      .find((p) => p.billable === "output_image" && p.unit === "token");
+
+    return {
+      capabilities: {
+        resolutions,
+        maxImageRefs,
+        supportsMultiOutput: maxCount > 1,
+      },
+      pricePerImageUsd: perImageEntry?.cost_usd ?? null,
+      suggestedImagePrices:
+        perImageEntry != null ? Object.fromEntries(resolutions.map((r) => [r, perImageEntry.cost_usd])) : null,
+      // Present but not auto-applied to `imagePrices` — needs an admin
+      // decision (typically inputPricePerM/outputPricePerM) since a flat
+      // per-image number can't be derived from a per-token rate here.
+      perTokenPriceUsd: perTokenEntry?.cost_usd ?? null,
+      providers: endpoints.map((e) => e.provider_name ?? "unknown"),
+    };
+  }
 
   @Get()
   async list() {
@@ -737,6 +1079,7 @@ class QualityRulesController {
       uncertaintyBand: rules.uncertaintyBand,
       minReviewerConfidence: rules.minReviewerConfidence,
       isSecondReviewEnabled: rules.isSecondReviewEnabled,
+      hardFailDefectCodes: rules.hardFailDefectCodes,
     };
   }
 
@@ -751,6 +1094,8 @@ class QualityRulesController {
       uncertaintyBand: z.number().int().min(0).max(20).optional(),
       minReviewerConfidence: z.number().int().min(0).max(100).optional(),
       isSecondReviewEnabled: z.boolean().optional(),
+      /** Defect codes that always FAIL a candidate regardless of the reviewer's own severity classification. */
+      hardFailDefectCodes: z.array(z.string().min(1).max(80)).max(100).optional(),
     });
     const input = parseWith(schema, body);
     const patch: Record<string, unknown> = { updatedAt: new Date() };

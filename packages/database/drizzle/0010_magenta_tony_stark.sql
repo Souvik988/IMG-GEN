@@ -1,0 +1,2 @@
+ALTER TABLE "jobs" ADD COLUMN "image_model_id" uuid;--> statement-breakpoint
+ALTER TABLE "jobs" ADD CONSTRAINT "jobs_image_model_id_model_registry_id_fk" FOREIGN KEY ("image_model_id") REFERENCES "public"."model_registry"("id") ON DELETE set null ON UPDATE no action;

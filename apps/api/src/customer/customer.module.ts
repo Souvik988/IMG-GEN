@@ -6,8 +6,8 @@ import {
   Module,
   UseGuards,
 } from "@nestjs/common";
-import { eq } from "drizzle-orm";
-import { characters, environmentPresets } from "@shotlin/database";
+import { and, eq } from "drizzle-orm";
+import { characters, environmentPresets, modelRegistry } from "@shotlin/database";
 import { AuthGuard } from "../common";
 import { AuthModule } from "../auth/auth.module";
 import { DB, type ApiDb } from "../infrastructure";
@@ -31,6 +31,15 @@ class ListingsService {
       .where(eq(environmentPresets.isEnabled, true))
       .orderBy(environmentPresets.sortOrder);
   }
+
+  /** Image-generation models a customer may explicitly choose between. Only the fields safe to show outside admin. */
+  async listImageModels() {
+    const rows = await this.db
+      .select({ id: modelRegistry.id, name: modelRegistry.name, notes: modelRegistry.notes })
+      .from(modelRegistry)
+      .where(and(eq(modelRegistry.role, "image_generator"), eq(modelRegistry.isEnabled, true)));
+    return rows;
+  }
 }
 
 @Controller("/customer")
@@ -46,6 +55,11 @@ class CustomerController {
   @Get("/environments")
   listEnvironments() {
     return this.service.listEnvironments();
+  }
+
+  @Get("/models")
+  listImageModels() {
+    return this.service.listImageModels();
   }
 }
 

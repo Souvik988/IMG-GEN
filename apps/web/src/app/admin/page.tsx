@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AppShell } from "../../components/app-shell";
-import { BudgetPanel, QualityRulesPanel, RunInspector, WorkflowStudio } from "../../components/workflow-studio";
+import { BudgetPanel, ModelsPanel, QualityRulesPanel, RunInspector, WorkflowStudio } from "../../components/workflow-studio";
 import { apiFetch } from "../../lib/api";
 
 type Overview = {
@@ -36,7 +36,7 @@ export default function Admin() {
     <nav className="admin-tabs" aria-label="Control room sections">{tabs.map((item) => <button className={`tab-pill ${tab === item ? "active" : ""}`} onClick={() => setTab(item)} key={item}>{item}</button>)}</nav>
     {tab === "Overview" && <OverviewPanel />}
     {tab === "Workflow Studio" && <WorkflowStudio />}
-    {tab === "Models" && <ResourcePanel title="Model registry" endpoint="/api/admin/models" collection="models" columns={["name", "provider", "role", "modelId", "isEnabled"]} />}
+    {tab === "Models" && <ModelsPanel />}
     {tab === "Prompts" && <PromptPanel />}
     {tab === "Skills" && <ResourcePanel title="Skill selector library" endpoint="/api/admin/skills" collection="skills" columns={["name", "category", "isEnabled"]} />}
     {tab === "Quality rules" && <QualityRulesPanel />}
