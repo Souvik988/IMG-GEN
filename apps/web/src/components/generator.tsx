@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./icon";
 import { apiFetch, type CatalogCharacter, type CatalogEnvironment, type CatalogImageModel } from "./api";
-import { CAMERA_ANGLES, resolveAngleSet, type CameraAngleKey } from "@shotlin/core";
+import { CAMERA_ANGLES, resolveAngleSet, type CameraAngleKey } from "./camera-angles";
 
 type Props = { onSubmit: (jobId: string) => void };
 type RecentProject = { id: string; state: string; display: string; resolution: string; aspectRatio: string; createdAt: string; thumbnailUrl: string | null };
