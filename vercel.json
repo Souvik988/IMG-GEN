@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "rootDirectory": "apps/web",
-  "framework": "nextjs",
+  "framework": "node",
   "installCommand": "cd ../.. && pnpm install --frozen-lockfile",
   "buildCommand": "cd ../.. && pnpm exec turbo run build --filter=shotlin-web",
   "outputDirectory": ".next"
