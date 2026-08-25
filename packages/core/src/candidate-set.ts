@@ -13,15 +13,6 @@ export type SetDecision = {
   reasons: string[];
 };
 
-/**
- * Roll a set of individually-reviewed candidates (one anchor plus any
- * fan-out angles) up into the single job-level decision that drives the
- * retry / second-review / finalize state machine.
- *
- * Invariant this function exists to protect: a candidate whose `decision` is
- * still null (never reviewed) must never cause a PASS roll-up — an unreviewed
- * image is not an approved image.
- */
 export function rollUpSetDecision(candidates: readonly CandidateOutcome[]): SetDecision {
   const reviewed = candidates.filter((c) => c.decision !== null);
   if (reviewed.length === 0) {
