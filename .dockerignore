@@ -1,0 +1,12 @@
+.git
+.next
+.turbo
+node_modules
+**/node_modules
+**/dist
+**/.next
+**/*.tsbuildinfo
+.env
+.env.*
+!.env.example
+apps/web/.next.previous

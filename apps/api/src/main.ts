@@ -49,8 +49,12 @@ async function bootstrap() {
   });
 
   app.setGlobalPrefix("api");
-  await app.listen(config.API_PORT, "0.0.0.0");
-  console.log(`✓ shotlin api listening on :${config.API_PORT}`);
+  // Railway assigns the public listener dynamically through PORT. Keep
+  // API_PORT as the local-development fallback so Docker and local scripts
+  // retain their existing behaviour.
+  const port = Number(process.env.PORT ?? config.API_PORT);
+  await app.listen(port, "0.0.0.0");
+  console.log(`✓ shotlin api listening on :${port}`);
 }
 
 bootstrap().catch((err) => {
