@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Icon } from "./icon";
-import { apiFetch } from "../lib/api";
+import { apiFetch } from "./api";
 
 const nav = [
   { href: "/", label: "Generate", icon: "spark" as const },

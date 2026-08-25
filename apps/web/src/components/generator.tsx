@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Icon } from "./icon";
-import { apiFetch, type CatalogCharacter, type CatalogEnvironment, type CatalogImageModel } from "../lib/api";
+import { apiFetch, type CatalogCharacter, type CatalogEnvironment, type CatalogImageModel } from "./api";
 import { CAMERA_ANGLES, resolveAngleSet, type CameraAngleKey } from "@shotlin/core";
 
 type Props = { onSubmit: (jobId: string) => void };

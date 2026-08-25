@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { AppShell } from "../../../components/app-shell";
 import { Icon } from "../../../components/icon";
-import { apiFetch } from "../../../lib/api";
+import { apiFetch } from "../../../components/api";
 
 type StateEvent = { toState: string; reason: string | null; createdAt: string };
 type JobStatus = {

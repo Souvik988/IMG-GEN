@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AppShell } from "../../components/app-shell";
 import { BudgetPanel, ModelsPanel, QualityRulesPanel, RunInspector, WorkflowStudio } from "../../components/workflow-studio";
-import { apiFetch } from "../../lib/api";
+import { apiFetch } from "../../components/api";
 
 type Overview = {
   jobsToday: number;

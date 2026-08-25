@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { apiFetch } from "../lib/api";
+import { apiFetch } from "./api";
 
 type Json = Record<string, unknown>;
 type StudioView = "canvas" | "wizard";

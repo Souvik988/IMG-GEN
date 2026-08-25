@@ -4,7 +4,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AppShell } from "../../components/app-shell";
 import { Icon } from "../../components/icon";
-import { apiFetch } from "../../lib/api";
+import { apiFetch } from "../../components/api";
 
 type Project = { id: string; state: string; display: string; resolution: string; aspectRatio: string; outputCount: number; createdAt: string; thumbnailUrl: string | null };
 

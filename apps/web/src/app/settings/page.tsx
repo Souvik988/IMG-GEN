@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { AppShell } from "../../components/app-shell";
-import { apiFetch } from "../../lib/api";
+import { apiFetch } from "../../components/api";
 
 type Settings = {
   providerKeys: { openrouterConfigured: boolean };
