@@ -120,10 +120,21 @@ async function main() {
     .onConflictDoNothing();
 
   /* ---------------- users ---------------- */
-  const adminPassword = process.env.SEED_ADMIN_PASSWORD ?? "shotlin-admin-123";
+  const adminEmail = process.env.SEED_ADMIN_EMAIL ?? "admin@shotlin.local";
+  const configuredAdminPassword = process.env.SEED_ADMIN_PASSWORD;
+  const adminPassword = configuredAdminPassword ?? "shotlin-admin-123";
 
-  const admin = await getOrCreate(db, users, "email", "admin@shotlin.local", {
-    email: "admin@shotlin.local",
+  if (process.env.NODE_ENV === "production" && !configuredAdminPassword) {
+    throw new Error(
+      "Missing required environment variable: SEED_ADMIN_PASSWORD. Set a unique password before running the production seed.",
+    );
+  }
+  if (configuredAdminPassword && configuredAdminPassword.length < 16) {
+    throw new Error("SEED_ADMIN_PASSWORD must be at least 16 characters long.");
+  }
+
+  const admin = await getOrCreate(db, users, "email", adminEmail, {
+    email: adminEmail,
     name: "Shotlin Admin",
     role: "admin",
     passwordHash: hashPassword(adminPassword),
@@ -1109,7 +1120,7 @@ Return ONLY valid JSON matching the quality-review schema.`,
   await backfillDeterministicCostEvents(db);
 
   console.log("✓ seed complete");
-  console.log("  admin:    admin@shotlin.local / (SEED_ADMIN_PASSWORD)");
+  console.log(`  admin:    ${adminEmail} / (SEED_ADMIN_PASSWORD)`);
   await pool.end();
 }
 
